@@ -292,6 +292,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   // versions using a compiler flag.
   // Default is pipelined and not warp-specialized.
 #if !defined(EXECMODE) || EXECMODE == 0
+  std::cout << "EXECMODE == 0" << std::endl;
   // Get the ptr to kernel function.
   void const *kernel = (void const *)fmhaForwardPipelinedNoWspl<
       PrecType, MmaC, SoftType, Mma2A, OutputType, TiledMma0, TiledMma1,
@@ -307,6 +308,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   auto ctaSize = size(TiledMma0{});
 
 #elif EXECMODE == 1
+  std::cout << "EXECMODE == 1" << std::endl;
   // Get the ptr to kernel function.
   void const *kernel = (void const *)fmhaForwardPipelinedWspl<
       PrecType, MmaC, SoftType, Mma2A, OutputType, TiledMma0, TiledMma1,
@@ -322,6 +324,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   auto ctaSize = size(TiledMma0{}) + NumCopyThreads;
 
 #elif EXECMODE == 2
+  std::cout << "EXECMODE == 2" << std::endl;
   // Get the ptr to kernel function.
   void const *kernel = (void const *)fmhaForwardNoPipeline<
       PrecType, MmaC, SoftType, Mma2A, OutputType, TiledMma0, TiledMma1,
@@ -348,6 +351,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
                                decltype(smemLayoutV), decltype(smemLayoutO),
                                ClusterShape>));
   cfk::utils::set_smem_size(smem_size, kernel);
+  std::cout << "smem_size:" << smem_size << std::endl;
 
   // Set the THREAD BLOCK (CTA) dimensions.
   // #threads in CTA = #threads in MMA (128 by default) + 128 (for WS).
