@@ -35,7 +35,12 @@ for q_blk in q_blk_sizes:
         print(c_cmd)
         print("=" * 100)
 
-        subprocess.run(c_cmd, shell=True)
+        result = subprocess.run(c_cmd, shell=True)
+        if result.returncode != 0:
+            print("Compile Error.")
+            continue
+        
+        print("Compile End.")
 
         for prec in precs:
             for head in head_sizes:
@@ -43,11 +48,11 @@ for q_blk in q_blk_sizes:
                 if input1 == verify or input1 == verify_all:
                     subprocess.run(f"./fmha_forward_pipeline --batch-size={batch_size} --seq-length={seq_len} --dim-size={head_num * head} --iterations=1 --head-size={head} --reference-check=true --prec-type={prec}", shell=True)
 
-                # FLOP RUN
-                if input1 != verify_all:
-                    print("*" * 100)
-                    print("FLOP RUN BEGIN")
-                    print(f"PREC={prec}, QBLK={q_blk}, KBLK={k_blk}, HEAD={head}, CTA={sys.argv[2]}, {sys.argv[3]}, {sys.argv[4]}, {sys.argv[5]}, {sys.argv[6]}")
-                    subprocess.run(f"./fmha_forward_pipeline --batch-size={batch_size} --seq-length={seq_len} --dim-size={head_num * head} --iterations=1000 --head-size={head} --reference-check=false --prec-type={prec}", shell=True)
-                    print("FLOP RUN END")
-                    print("*" * 100)
+                # # FLOP RUN
+                # if input1 != verify_all:
+                #     print("*" * 100)
+                #     print("FLOP RUN BEGIN")
+                #     print(f"PREC={prec}, QBLK={q_blk}, KBLK={k_blk}, HEAD={head}, CTA={sys.argv[2]}, {sys.argv[3]}, {sys.argv[4]}, {sys.argv[5]}, {sys.argv[6]}")
+                #     subprocess.run(f"./fmha_forward_pipeline --batch-size={batch_size} --seq-length={seq_len} --dim-size={head_num * head} --iterations=1000 --head-size={head} --reference-check=false --prec-type={prec}", shell=True)
+                #     print("FLOP RUN END")
+                #     print("*" * 100)

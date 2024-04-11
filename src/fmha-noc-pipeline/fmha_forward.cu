@@ -104,6 +104,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   using bM = Int<kQueriesPerBlock>;
   using bN = Int<kKeysPerBlock>;
   using bK = Int<HEADDIM>;
+  using bKblock = Int<HEADDIM / SplitNum>;
 #if EXECMODE == 2
   using STAGES = Int<1>;
 #else
@@ -180,25 +181,25 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
 // We assume V is NOT transposed in memory by default.
 // For now, if we enable V FP8, then we will also transpose V offline.
 #ifndef GEMM2FP8
-  auto tileShapeV = make_shape(bN{}, bK{});
-  auto smemLayoutAtomV = getSmemLayoutK<Mma2B, HEADDIM>();
+  auto tileShapeV = make_shape(bN{}, bKblock{});
+  auto smemLayoutAtomV = getSmemLayoutK<Mma2B, HEADDIM / SplitNum>();
   // For pipelined FMHA, the third dimension for SMEM V is the number of stages.
   auto smemLayoutV = tile_to_shape(
       smemLayoutAtomV,
       make_shape(shape<0>(tileShapeV), shape<1>(tileShapeV), STAGES()));
   Layout gmemLayoutV =
-      make_layout(make_shape(N, K, H, B), make_stride(K * H, 1, K, H * K * N));
+      make_layout(make_shape(N, K / SplitNum, SplitNum, H, B), make_stride(K * H, 1, K / SplitNum, K, H * K * N));
   Tensor gV = make_tensor(ptrV, gmemLayoutV);
   auto tmaV = make_tma_copy(TMA_LOAD{}, gV, smemLayoutV(_, _, 0), tileShapeV,
                             size<0>(ClusterShape{}));
 
   // Layout for Vtranspose. For use in GEMM-II.
   // Note this is the transpose in terms of the view, not in terms of memory.
-  auto tileShapeVt = make_shape(bK{}, bN{});
+  auto tileShapeVt = make_shape(bKblock{}, bN{});
   auto smemLayoutVtFp16 = composition(
       smemLayoutV, make_layout(make_shape(shape<0>(tileShapeVt),
                                           shape<1>(tileShapeVt), STAGES()),
-                               make_stride(bN{}, Int<1>{}, bK{} * bN{})));
+                               make_stride(bN{}, Int<1>{}, bKblock{} * bN{})));
 
   auto smemLayoutVtFp8 = tile_to_shape(
       //GMMA::Layout_K_SW64_Atom<Mma2B>{},
@@ -241,12 +242,12 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   auto srcSmemLayoutV = smemLayoutV;
 #endif
 
-  auto tileShapeO = make_shape(bM{}, bK{});
+  auto tileShapeO = make_shape(bM{}, bKblock{});
   Layout gmemLayoutO =
-      make_layout(make_shape(M, K, H, B), make_stride(K * H, 1, K, H * M * K));
+      make_layout(make_shape(M, K / SplitNum, SplitNum, H, B), make_stride(K * H, 1, K / SplitNum, K, H * M * K));
   auto smemLayoutO =
-      tile_to_shape(getSmemLayoutK<OutputType, bK{}>(),
-                    make_shape(shape<0>(tileShapeQ), shape<1>(tileShapeQ)));
+      tile_to_shape(getSmemLayoutK<OutputType, bKblock{}>(),
+                    make_shape(bM{}, bKblock{}));
   Tensor gO = make_tensor(tensorO, gmemLayoutO);
   auto tmaO =
       make_tma_copy(SM90_TMA_STORE{}, gO, smemLayoutO, tileShapeO, Int<1>{});
@@ -280,7 +281,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
 #else
   // USE RS version of GMMA for GEMM-II (Default).
   using TiledMma1 = decltype(cute::make_tiled_mma(
-      rs_op_selector_custom<Mma2A, Mma2B, Mma2C, Shape<bM, bK, bN>,
+      rs_op_selector_custom<Mma2A, Mma2B, Mma2C, Shape<bM, bKblock, bN>,
                             GMMA::Major::K, majorV>(),
       MmaTileShape{}));
 #endif
@@ -362,11 +363,10 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   // First dimension = # of blocks of Q.
   // Second dimension = # of heads.
   // Third dimension = # of batches.
-  dim3 grid_dims(ceil_div(size(M), size(bM{})), H, B);
+  dim3 grid_dims(ceil_div(size(M), size(bM{})), SplitNum, H * B);
 
   // Set the CLUSTER dimensions.
-  dim3 cluster_dims(size<0>(ClusterShape{}), size<1>(ClusterShape{}),
-                    size<2>(ClusterShape{}));
+  dim3 cluster_dims(size<0>(ClusterShape{}), SplitNum, size<2>(ClusterShape{}));
 
   // Define the cluster launch parameter structure.
   cutlass::ClusterLaunchParams params{grid_dims, block_dims, cluster_dims,

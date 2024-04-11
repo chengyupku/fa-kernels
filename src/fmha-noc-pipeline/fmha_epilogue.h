@@ -1,7 +1,9 @@
 #pragma once
 
+#include <cooperative_groups.h>
 #include "online_softmax.h"
 #include "shared_storage.h"
+#include "noc_config.h"
 
 // Epilogue that copies RowSum and RowMax (For debugging only).
 template <class RowMax, class RowSum, class SoftType, class TiledMma0,
@@ -15,8 +17,8 @@ fmhaForwardWriteOutSoftMax(const RowMax &rowMax, const RowSum &rowSum,
 
   // Get the block coordinates for this CTA.
   auto blockIdxX = uint64_t(blockIdx.x);
-  auto blockIdxH = uint64_t(blockIdx.y);
-  auto blockIdxB = uint64_t(blockIdx.z);
+  auto blockIdxH = uint64_t(blockIdx.z % H);
+  auto blockIdxB = uint64_t(blockIdx.z / H);
 
   Tensor miGlobal = make_tensor(make_gmem_ptr(mi_ptr), gmemLayoutMi);
   Tensor miGlobalOut =
@@ -58,8 +60,8 @@ fmhaForwardWriteOut(TensorO &tOrO, const RowMax &rowMax, const RowSum &rowSum,
 
   // Get the block coordinates for this CTA.
   auto blockIdxX = uint64_t(blockIdx.x);
-  auto blockIdxH = uint64_t(blockIdx.y);
-  auto blockIdxB = uint64_t(blockIdx.z);
+  auto blockIdxH = uint64_t(blockIdx.z % H);
+  auto blockIdxB = uint64_t(blockIdx.z / H);
 
   // Apply softmax normalization before writing out to GMEM.
   applySoftmaxNormalizer<SoftType>(rowSum, tOrO);
@@ -88,8 +90,8 @@ fmhaForwardWriteOutCoalesced(TensorO &tOrO, const RowMax &rowMax,
 
   // Get the block coordinates for this CTA.
   auto blockIdxX = uint64_t(blockIdx.x);
-  auto blockIdxH = uint64_t(blockIdx.y);
-  auto blockIdxB = uint64_t(blockIdx.z);
+  auto blockIdxH = uint64_t(blockIdx.z % H);
+  auto blockIdxB = uint64_t(blockIdx.z / H);
 
   // Apply softmax normalization before writing out to GMEM.
   applySoftmaxNormalizer<SoftType>(rowSum, tOrO);
@@ -129,10 +131,15 @@ fmhaForwardWriteOutTMA(TensorO &tOrO, const RowMax &rowMax,
                        TiledCopyO const &tmaStoreO, bool leaderWarp,
                        const SoftType &) {
 
+  namespace cg = cooperative_groups;
+  cg::cluster_group cluster = cg::this_cluster();
+  dim3 cluster_shape = cluster.dim_blocks();
+  uint32_t clusterBlockRank = cluster.block_rank();
+
   // Get the block coordinates for this CTA.
   auto blockIdxX = uint64_t(blockIdx.x);
-  auto blockIdxH = uint64_t(blockIdx.y);
-  auto blockIdxB = uint64_t(blockIdx.z);
+  auto blockIdxH = uint64_t(blockIdx.z % H);
+  auto blockIdxB = uint64_t(blockIdx.z / H);
 
   // Apply softmax normalization before writing out to GMEM.
   applySoftmaxNormalizer<SoftType>(rowSum, tOrO);
@@ -154,7 +161,7 @@ fmhaForwardWriteOutTMA(TensorO &tOrO, const RowMax &rowMax,
 
   Tensor mO = tmaStoreO.get_tma_tensor(shape(gmemLayoutO));
   auto blkCoordO = make_coord(blockIdxX, 0, blockIdxH, blockIdxB);
-  Tensor gO = local_tile(mO, tileShapeO, blkCoordO);
+  Tensor gO = local_tile(mO(_,_,clusterBlockRank,_,_), tileShapeO, blkCoordO);
 
   auto cta_tmaO = tmaStoreO.get_slice(0);
 

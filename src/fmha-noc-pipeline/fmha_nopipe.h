@@ -78,8 +78,8 @@ fmhaForwardNoPipeline(
 
   // Get the block coordinates for this CTA.
   auto blockIdxX = uint64_t(blockIdx.x);
-  auto blockIdxH = uint64_t(blockIdx.y);
-  auto blockIdxB = uint64_t(blockIdx.z);
+  auto blockIdxH = uint64_t(blockIdx.z % H);
+  auto blockIdxB = uint64_t(blockIdx.z / H);
 
   // Construct SMEM tensors.
   Tensor sQ =

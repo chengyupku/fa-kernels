@@ -62,6 +62,7 @@
 #include "fmha_epilogue.h"
 #include "fmha_producer.h"
 #include "shared_storage.h"
+#include "noc_config.h"
 
 using namespace cute;
 using namespace cutlass;
@@ -148,8 +149,8 @@ fmhaForwardPipelinedWspl(
 
   // Get the block coordinates for this CTA.
   auto blockIdxX = uint64_t(blockIdx.x);
-  auto blockIdxH = uint64_t(blockIdx.y);
-  auto blockIdxB = uint64_t(blockIdx.z);
+  auto blockIdxH = uint64_t(blockIdx.z % H);
+  auto blockIdxB = uint64_t(blockIdx.z / H);
 
   // No pipelining for copying the block of Q.
 
@@ -336,7 +337,7 @@ fmhaForwardPipelinedWspl(
       //    warpgroup_fence_operand(tSrS);
       //    warpgroup_fence_operand(tOrO);
 
-      pipeline.consumer_release(smem_pipe_release);
+      pipeline.consumer_release_self(smem_pipe_release);
 
       // Advance stages
       ++smem_pipe_read;
@@ -346,7 +347,7 @@ fmhaForwardPipelinedWspl(
     warpgroup_wait<0>();
     // Tail Loop
     for (int i = 0; i < K_PIPE_MMAS; ++i) {
-      pipeline.consumer_release(smem_pipe_release);
+      pipeline.consumer_release_self(smem_pipe_release);
       ++smem_pipe_release;
     }
 

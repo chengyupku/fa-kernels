@@ -3,6 +3,7 @@
 #include "online_softmax.h"
 #include "reg2reg.h"
 #include "shared_storage.h"
+#include "noc_config.h"
 
 // FMHA Consumer does GEMMs and softmax
 template <class Gemm1Type, class AccumType, class SoftType, class Gemm2Type,
@@ -31,8 +32,8 @@ fmhaForwardConsumer(Gemm1Type const *Q, Gemm1Type const *K, Gemm2Type const *V,
 #ifdef COPYOUTMM0
   // Get the block coordinates for this CTA.
   auto blockIdxX = uint64_t(blockIdx.x);
-  auto blockIdxH = uint64_t(blockIdx.y);
-  auto blockIdxB = uint64_t(blockIdx.z);
+  auto blockIdxH = uint64_t(blockIdx.z % H);
+  auto blockIdxB = uint64_t(blockIdx.z / H);
   auto threadMma0 = tiledMma0.get_thread_slice(threadIdx.x);
   Tensor mS = make_tensor(make_gmem_ptr(S), gmemLayoutS);
   auto blkCoordS = make_coord(blockIdxX, blockIdxY, blockIdxH, blockIdxB);

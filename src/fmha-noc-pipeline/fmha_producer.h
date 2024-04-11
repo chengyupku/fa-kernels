@@ -1,5 +1,7 @@
 #pragma once
 
+#include "noc_config.h"
+
 // FMHA Producer does K and V copy
 template <class TensorEngineK, class SmemLayoutK, class TiledCopyK,
           class TileShapeK, class GmemLayoutK, class TensorEngineV,
@@ -16,15 +18,22 @@ fmhaForwardProducer(Tensor<TensorEngineK, SmemLayoutK> &&sK,
 
   using namespace cute;
 
-  auto blockIdxH = uint64_t(blockIdx.y);
-  auto blockIdxB = uint64_t(blockIdx.z);
+  namespace cg = cooperative_groups;
+  cg::cluster_group cluster = cg::this_cluster();
+  dim3 cluster_shape = cluster.dim_blocks();
+  uint32_t clusterBlockRank = cluster.block_rank();
+
+  auto blockIdxH = uint64_t(blockIdx.z % H);
+  auto blockIdxB = uint64_t(blockIdx.z / H);
 
   // Get the full un-partitioned tensors.
   // TMA tensors are special tensors.
   Tensor mK = tmaLoadK.get_tma_tensor(shape(gmemLayoutK));
   Tensor mV = tmaLoadV.get_tma_tensor(shape(gmemLayoutV));
 
-  uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
+  // NOTICE: block_rank_in_cluster is hard coded to 0
+  // uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
+  uint32_t block_rank_in_cluster = 0;
   constexpr uint32_t cluster_shape_x = get<0>(ClusterShape{});
   uint2 cluster_local_block_id = {block_rank_in_cluster % cluster_shape_x,
                                   block_rank_in_cluster / cluster_shape_x};
@@ -59,7 +68,7 @@ fmhaForwardProducer(Tensor<TensorEngineK, SmemLayoutK> &&sK,
   auto blkCoordV = make_coord(blockIdxY, 0, blockIdxH, blockIdxB);
 #endif
 
-  Tensor gV = local_tile(mV, tileShapeV, blkCoordV);
+  Tensor gV = local_tile(mV(_,_,clusterBlockRank,_,_), tileShapeV, blkCoordV);
 
   Tensor tVgVX = blockTmaV.partition_S(gV);
   Tensor tVgV = group_modes<1, rank(tVgVX)>(tVgVX); // (TMA,REST)
