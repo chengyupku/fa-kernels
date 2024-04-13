@@ -4,7 +4,7 @@ import sys
 # Parameters
 q_blk_sizes = [64]
 k_blk_sizes = [64]
-head_sizes = [256]
+head_sizes = [512]
 head_num = 16
 batch_size = 1
 seq_len = 4096
@@ -48,11 +48,11 @@ for q_blk in q_blk_sizes:
                 if input1 == verify or input1 == verify_all:
                     subprocess.run(f"./fmha_forward_pipeline --batch-size={batch_size} --seq-length={seq_len} --dim-size={head_num * head} --iterations=1 --head-size={head} --reference-check=true --prec-type={prec}", shell=True)
 
-                # # FLOP RUN
-                # if input1 != verify_all:
-                #     print("*" * 100)
-                #     print("FLOP RUN BEGIN")
-                #     print(f"PREC={prec}, QBLK={q_blk}, KBLK={k_blk}, HEAD={head}, CTA={sys.argv[2]}, {sys.argv[3]}, {sys.argv[4]}, {sys.argv[5]}, {sys.argv[6]}")
-                #     subprocess.run(f"./fmha_forward_pipeline --batch-size={batch_size} --seq-length={seq_len} --dim-size={head_num * head} --iterations=1000 --head-size={head} --reference-check=false --prec-type={prec}", shell=True)
-                #     print("FLOP RUN END")
-                #     print("*" * 100)
+                # FLOP RUN
+                if input1 != verify_all:
+                    print("*" * 100)
+                    print("FLOP RUN BEGIN")
+                    print(f"PREC={prec}, QBLK={q_blk}, KBLK={k_blk}, HEAD={head}, CTA={sys.argv[2]}, {sys.argv[3]}, {sys.argv[4]}, {sys.argv[5]}, {sys.argv[6]}")
+                    subprocess.run(f"./fmha_forward_pipeline --batch-size={batch_size} --seq-length={seq_len} --dim-size={head_num * head} --iterations=1000 --head-size={head} --reference-check=false --prec-type={prec}", shell=True)
+                    print("FLOP RUN END")
+                    print("*" * 100)

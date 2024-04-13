@@ -27,6 +27,8 @@ void initialize_rand(TIN *ptr, size_t capacity,
       scope_max = TIN(8);
       scope_min = TIN(-8);
     }
+    // scope_max = TIN(2);
+    // scope_min = TIN(2);
 
     cutlass::reference::device::BlockFillRandomUniform(ptr, capacity, seed,
                                                        scope_max, scope_min, 0);
@@ -66,6 +68,19 @@ bool verify_tensor(thrust::host_vector<Element> vector_Input,
   // 10% for relative error
   float rel_tol = 1e-1f;
   int errCount = 0;
+  // for (int64_t i = 0; i < 16; ++i) {
+  //   for (int64_t j = 0; j < 256; ++j) {
+  //     printf("%.2f ", vector_Input[i * 256 + j]);
+  //   }
+  //   printf("\n");
+  // }
+  // printf("--------------------------------\n");
+  // for (int64_t i = 0; i < 16; ++i) {
+  //   for (int64_t j = 0; j < 256; ++j) {
+  //     printf("%.2f ", vector_Input_Ref[i * 256 + j]);
+  //   }
+  //   printf("\n");
+  // }
   for (int64_t i = 0; i < size; ++i) {
     if (printValues)
       std::cout << vector_Input[i] << " " << vector_Input_Ref[i] << std::endl;

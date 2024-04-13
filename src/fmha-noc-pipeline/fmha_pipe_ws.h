@@ -112,6 +112,10 @@ fmhaForwardPipelinedWspl(
 
   auto cluster_shape = ClusterShape{};
 
+  namespace cg = cooperative_groups;
+  cg::cluster_group cluster = cg::this_cluster();
+  uint32_t clusterBlockRank = cluster.block_rank();
+
   // Unlike the unit test we always set this variable to 1
   // independent of cluster size.
   uint32_t const NumProducers = 1;
@@ -138,7 +142,11 @@ fmhaForwardPipelinedWspl(
 #else
   // Just a dummy sS (with smem_v). It's required only for shape later.
   Tensor sS =
-      make_tensor(make_smem_ptr(shared_storage.kv.smem_k.data()), smemLayoutS);
+      make_tensor(make_smem_ptr(reinterpret_cast<AccumType*>(shared_storage.smem_s.data())), smemLayoutS);
+      // make_tensor(make_smem_ptr(reinterpret_cast<AccumType*>(shared_storage.kv.smem_k.data()) + 0       ), smemLayoutS);
+  Tensor sR =
+      make_tensor(make_smem_ptr(reinterpret_cast<AccumType*>(shared_storage.smem_r.data())), smemLayoutS);
+      // make_tensor(make_smem_ptr(reinterpret_cast<AccumType*>(shared_storage.kv.smem_k.data()) + size(sS)), smemLayoutS);
 #endif
   Tensor sV =
       make_tensor(make_smem_ptr(shared_storage.kv.smem_v.data()), smemLayoutV);
@@ -156,7 +164,7 @@ fmhaForwardPipelinedWspl(
 
   // Get the block of Q for this CTA using the block coordinates
   auto blkCoordQ = make_coord(blockIdxX, 0, blockIdxH, blockIdxB);
-  Tensor gQ = local_tile(mQ, tileShapeQ, blkCoordQ);
+  Tensor gQ = local_tile(mQ(_,_,clusterBlockRank,_,_), tileShapeQ, blkCoordQ);
 
   // Partition the copying of source tiles for Q among threads.
   auto cta_tmaQ = tmaLoadQ.get_slice(0);
@@ -233,6 +241,19 @@ fmhaForwardPipelinedWspl(
   MainloopPipeline pipeline(shared_storage.storage, params, cluster_shape);
   // Change to this to use with CUTLASS 3.3 Pipeline API
   // MainloopPipeline pipeline(shared_storage.storage, params);
+
+  using FullBarrier = cutlass::arch::ClusterTransactionBarrier;
+  using EmptyBarrier = cutlass::arch::ClusterBarrier;
+
+  FullBarrier  *send_mbar_ptr = reinterpret_cast<FullBarrier *>(&(shared_storage.noc_send[0]));
+  EmptyBarrier *recv_mbar_ptr = reinterpret_cast<EmptyBarrier*>(&(shared_storage.noc_recv[0]));
+  if (threadIdx.x == 0) {
+    send_mbar_ptr[0].init(1);
+    recv_mbar_ptr[0].init(1);
+  }
+
+  uint32_t producer_phase = 0;
+  uint32_t consumer_phase = 0;
 
   int blockIdxY = 0;
 
@@ -316,7 +337,9 @@ fmhaForwardPipelinedWspl(
       fmhaForwardConsumer(Q, K, V, S, tSrQ, tSrK(_, _, _, stage), tSrS,
                           tOrV(_, _, _, stage), tOrO, tOrPLayout, reg2reg, rowMax,
                           rowSum, tileShapeS, gmemLayoutS, scale, blockIdxY++,
-                          tiledMma0, tiledMma1, AccumType(0), SoftType(0));
+                          tiledMma0, tiledMma1, 
+                          send_mbar_ptr, recv_mbar_ptr, 
+                          sS, sR, producer_phase, consumer_phase, AccumType(0), SoftType(0));
       ++smem_pipe_read;
     }
     gemm_k_iterations -= mma_k_prologue;
@@ -331,7 +354,9 @@ fmhaForwardPipelinedWspl(
       fmhaForwardConsumer(Q, K, V, S, tSrQ, tSrK(_, _, _, stage), tSrS,
                           tOrV(_, _, _, stage), tOrO, tOrPLayout, reg2reg, rowMax,
                           rowSum, tileShapeS, gmemLayoutS, scale, blockIdxY++,
-                          tiledMma0, tiledMma1, AccumType(0), SoftType(0));
+                          tiledMma0, tiledMma1, 
+                          send_mbar_ptr, recv_mbar_ptr,
+                          sS, sR, producer_phase, consumer_phase, AccumType(0), SoftType(0));
 
       warpgroup_wait<2 * K_PIPE_MMAS>();
       //    warpgroup_fence_operand(tSrS);

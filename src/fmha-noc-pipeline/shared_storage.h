@@ -76,9 +76,13 @@ struct SharedStorage {
           kv;
       cute::array_aligned<OutputType, cute::cosize_v<SmemLayoutO>> smem_o;
     };
+    cute::array_aligned<float, cute::cosize_v<SmemLayoutS>> smem_s;
+    cute::array_aligned<float, cute::cosize_v<SmemLayoutS>> smem_r;
   };
   struct {
     cute::uint64_t tma_load_mbar[8]; // 8 TMA barriers pre-allocated for usage.
+    cute::uint64_t noc_send[1];
+    cute::uint64_t noc_recv[1];
     typename cutlass::PipelineTmaAsync<stageCount>::SharedStorage storage;
   };
 };

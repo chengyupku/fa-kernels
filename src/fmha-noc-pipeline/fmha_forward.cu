@@ -145,23 +145,23 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   auto ptrQ = reinterpret_cast<PrecType const *>(tensorQ);
   auto ptrK = reinterpret_cast<PrecType const *>(tensorK);
   auto ptrV = reinterpret_cast<Gemm2Type const *>(tensorV);
-  auto tileShapeQ = make_shape(bM{}, bK{});
+  auto tileShapeQ = make_shape(bM{}, bKblock{});
   auto smemLayoutQ =
-      tile_to_shape(getSmemLayoutK<MmaA, HEADDIM>(),
+      tile_to_shape(getSmemLayoutK<MmaA, HEADDIM / SplitNum>(),
                     make_shape(shape<0>(tileShapeQ), shape<1>(tileShapeQ)));
   Layout gmemLayoutQ =
-      make_layout(make_shape(M, K, H, B), make_stride(K * H, 1, K, H * M * K));
+      make_layout(make_shape(M, K / SplitNum, SplitNum, H, B), make_stride(K * H, 1, K / SplitNum, K, H * M * K));
   Tensor gQ = make_tensor(ptrQ, gmemLayoutQ);
   auto tmaQ =
       make_tma_copy(SM90_TMA_LOAD{}, gQ, smemLayoutQ, tileShapeQ, Int<1>{});
 
-  auto tileShapeK = make_shape(bN{}, bK{});
+  auto tileShapeK = make_shape(bN{}, bKblock{});
   // For pipelined FMHA, the third dimension for SMEM K is the number of stages.
   auto smemLayoutK = tile_to_shape(
-      getSmemLayoutK<MmaB, HEADDIM>(),
+      getSmemLayoutK<MmaB, HEADDIM / SplitNum>(),
       make_shape(shape<0>(tileShapeK), shape<1>(tileShapeK), STAGES()));
   Layout gmemLayoutK =
-      make_layout(make_shape(N, K, H, B), make_stride(K * H, 1, K, H * N * K));
+      make_layout(make_shape(N, K / SplitNum, SplitNum, H, B), make_stride(K * H, 1, K / SplitNum, K, H * N * K));
   Tensor gK = make_tensor(ptrK, gmemLayoutK);
   auto tmak = make_tma_copy(TMA_LOAD{}, gK, smemLayoutK(_, _, 0), tileShapeK,
                             size<0>(ClusterShape{}));
@@ -170,13 +170,18 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   auto tileShapeS = make_shape(bM{}, bN{});
   Layout gmemLayoutS =
       make_layout(make_shape(M, N, H, B), make_stride(N, 1, N * M, H * M * N));
-  // Used only for Second matmul with Q and V.
-  auto smemLayoutAtomS =
-      cute::conditional_return<is_same_v<MmaA, cutlass::half_t>>(
-          getSmemLayoutK<MmaA, bN{}>(), GMMA::Layout_K_INTER_Atom<MmaA>{});
+  // // Used only for Second matmul with Q and V.
+  // auto smemLayoutAtomS =
+  //     cute::conditional_return<is_same_v<MmaA, cutlass::half_t>>(
+  //         getSmemLayoutK<MmaA, bN{}>(), GMMA::Layout_K_INTER_Atom<MmaA>{});
+
+  auto smemLayoutAtomS = GMMA::Layout_K_SW128_Atom<MmaC>{};
+  // auto smemLayoutS = tile_to_shape(
+  //     smemLayoutAtomS,
+  //     make_shape(shape<0>(tileShapeS), shape<1>(tileShapeS), STAGES()));
   auto smemLayoutS = tile_to_shape(
       smemLayoutAtomS,
-      make_shape(shape<0>(tileShapeS), shape<1>(tileShapeS), STAGES()));
+      make_shape(shape<0>(tileShapeS), shape<1>(tileShapeS), _1{}));
 
 // We assume V is NOT transposed in memory by default.
 // For now, if we enable V FP8, then we will also transpose V offline.
@@ -268,7 +273,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
 #else
   // USE SS version of GMMA for GEMM-I.
   using TiledMma0 = decltype(cute::make_tiled_mma(
-      ss_op_selector_custom<MmaA, MmaB, MmaC, Shape<bM, bN, bK>>(),
+      ss_op_selector_custom<MmaA, MmaB, MmaC, Shape<bM, bN, bKblock>>(),
       MmaTileShape{}));
 #endif
 
@@ -487,12 +492,12 @@ void testFmhaForward(int m, int n, int numHeads, int batchSize, int iterations,
   cutlass::Distribution::Kind initV;
   if (refCheck) {
     // Change to Uniform for easier debugging
-    // initQ = cutlass::Distribution::Uniform;
-    // initK = cutlass::Distribution::Uniform;
-    // initV = cutlass::Distribution::Uniform;
-    initQ = cutlass::Distribution::Gaussian;
-    initK = cutlass::Distribution::Gaussian;
-    initV = cutlass::Distribution::Gaussian;
+    initQ = cutlass::Distribution::Uniform;
+    initK = cutlass::Distribution::Uniform;
+    initV = cutlass::Distribution::Uniform;
+    // initQ = cutlass::Distribution::Gaussian;
+    // initK = cutlass::Distribution::Gaussian;
+    // initV = cutlass::Distribution::Gaussian;
   } else {
     initQ = cutlass::Distribution::Gaussian;
     initK = cutlass::Distribution::Gaussian;
@@ -757,6 +762,10 @@ int main(int argc, char const **argv) {
                                             printValues, printDiffs, nStreams);
     } else if (kHeadSize == 256) {
       testFmhaForward<cutlass::half_t, 256>(seqLength, seqLength, numHeads,
+                                            batchSize, iterations, refCheck,
+                                            printValues, printDiffs, nStreams);
+    } else if (kHeadSize == 512) {
+      testFmhaForward<cutlass::half_t, 512>(seqLength, seqLength, numHeads,
                                             batchSize, iterations, refCheck,
                                             printValues, printDiffs, nStreams);
     } else {

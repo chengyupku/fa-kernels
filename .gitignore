@@ -1,3 +1,4 @@
 logs/*
 .vscode/*
 *.d
+*.ncu-rep

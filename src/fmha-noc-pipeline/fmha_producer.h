@@ -13,8 +13,7 @@ fmhaForwardProducer(Tensor<TensorEngineK, SmemLayoutK> &&sK,
                     GmemLayoutK gmemLayoutK,
                     Tensor<TensorEngineV, SmemLayoutV> &&sV,
                     TiledCopyV const &tmaLoadV, TileShapeV tileShapeV,
-                    GmemLayoutV gmemLayoutV, int blockIdxY, BarrierType *tmaBar,
-                    const ClusterShape &) {
+                    GmemLayoutV gmemLayoutV, int blockIdxY, BarrierType *tmaBar, const ClusterShape &) {
 
   using namespace cute;
 
@@ -54,7 +53,7 @@ fmhaForwardProducer(Tensor<TensorEngineK, SmemLayoutK> &&sK,
   // Get the GMEM tensors for K and V
   //
   auto blkCoordK = make_coord(blockIdxY, 0, blockIdxH, blockIdxB);
-  Tensor gK = local_tile(mK, tileShapeK, blkCoordK);
+  Tensor gK = local_tile(mK(_,_,clusterBlockRank,_,_), tileShapeK, blkCoordK);
 
   Tensor tKgKX = blockTmaK.partition_S(gK);
   Tensor tKgK = group_modes<1, rank(tKgKX)>(tKgKX); // (TMA,REST)
