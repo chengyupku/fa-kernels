@@ -57,7 +57,8 @@
 #include "cute/arch/cluster_sm90.hpp"
 #include "cutlass/arch/barrier.h"
 #include "cutlass/arch/reg_reconfig.h"
-#include "cutlass/pipeline/pipeline.hpp"
+// #include "cutlass/pipeline/pipeline.hpp"
+#include "async_pipeline.hpp"
 #include "fmha_consumer.h"
 #include "fmha_epilogue.h"
 #include "fmha_producer.h"
@@ -90,7 +91,7 @@ fmhaForwardPipelinedWspl(
     SoftType *mi_ptr, SoftType *sPrimePtr, GmemLayoutMI gmemLayoutMi,
     float scale) {
   extern __shared__ char shared_memory[];
-  using MainloopPipeline = typename cutlass::PipelineTmaAsync<stageCount>;
+  using MainloopPipeline = typename cutlass::PipelineTmaNoCAsync<stageCount>;
   // Change to this to use with CUTLASS 3.3 Pipeline API
   // using MainloopPipeline =
   //     typename cutlass::PipelineTmaAsync<stageCount, ClusterShape>;
@@ -271,8 +272,9 @@ fmhaForwardPipelinedWspl(
     // calls setmaxnreg.dec.sync.aligned.u32
     cutlass::arch::warpgroup_reg_dealloc<80>();
 
-    int lane_predicate = cute::elect_one_sync();
-    if (warp_idx_in_warpgroup == 0 && lane_predicate) {
+    // int lane_predicate = cute::elect_one_sync();
+    // if (warp_idx_in_warpgroup == 0 && lane_predicate) {
+    if (threadIdx.x == 0) {
 
       int tma_k_prologue = min(stageCount, nTilesOfK);
 

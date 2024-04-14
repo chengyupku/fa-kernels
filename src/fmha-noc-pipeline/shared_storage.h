@@ -31,7 +31,8 @@ constexpr int NumMmaWarpGroups = 1;
 constexpr int NumMmaThreads = 128;
 #endif
 
-#include "cutlass/pipeline/pipeline.hpp"
+// #include "cutlass/pipeline/pipeline.hpp"
+#include "async_pipeline.hpp"
 
 // Shared Storage with Aligned addresses.
 template <class Gemm1Type, class Gemm2Type, class SmemLayoutK,
@@ -83,7 +84,7 @@ struct SharedStorage {
     cute::uint64_t tma_load_mbar[8]; // 8 TMA barriers pre-allocated for usage.
     cute::uint64_t noc_send[1];
     cute::uint64_t noc_recv[1];
-    typename cutlass::PipelineTmaAsync<stageCount>::SharedStorage storage;
+    typename cutlass::PipelineTmaNoCAsync<stageCount>::SharedStorage storage;
   };
 };
 #endif
