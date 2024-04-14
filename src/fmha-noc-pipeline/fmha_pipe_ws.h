@@ -68,13 +68,12 @@ using namespace cute;
 using namespace cutlass;
 
 template <class Gemm1Type, class AccumType, class SoftType, class Gemm2Type,
-          class OutputType, class TiledMma0, class TiledMma1, class TiledCopyQ,
-          class TileShapeQ, class GmemLayoutQ, class SmemLayoutQ,
-          class TiledCopyK, class TileShapeK, class GmemLayoutK,
-          class SmemLayoutK, class TileShapeS, class GmemLayoutS,
-          class SmemLayoutS, class TiledCopyV, class TileShapeV,
-          class GmemLayoutV, class SmemLayoutV, class SmemLayoutVt,
-          class TiledCopyO, class TileShapeO, class GmemLayoutO,
+          class OutputType, class TiledMma0, class TiledMma1, class TiledMmaCvt0,
+          class TiledCopyQ, class TileShapeQ, class GmemLayoutQ, class SmemLayoutQ,
+          class TiledCopyK, class TileShapeK, class GmemLayoutK, class SmemLayoutK, 
+          class TileShapeS, class GmemLayoutS, class SmemLayoutS, class SmemLayoutPS, 
+          class TiledCopyV, class TileShapeV, class GmemLayoutV, class SmemLayoutV, 
+          class SmemLayoutVt, class TiledCopyO, class TileShapeO, class GmemLayoutO,
           class SmemLayoutO, class GmemLayoutMI, class ClusterShape>
 __global__ static void __launch_bounds__(384, 1)
 fmhaForwardPipelinedWspl(
@@ -83,7 +82,7 @@ fmhaForwardPipelinedWspl(
     Gemm1Type const *K, CUTE_GRID_CONSTANT TiledCopyK const tmaLoadK,
     TileShapeK tileShapeK, GmemLayoutK gmemLayoutK, SmemLayoutK smemLayoutK,
     Gemm1Type *S, TileShapeS tileShapeS, GmemLayoutS gmemLayoutS,
-    SmemLayoutS smemLayoutS, int nTilesOfK, Gemm2Type *V,
+    SmemLayoutS smemLayoutS, SmemLayoutPS smemLayoutPS, int nTilesOfK, Gemm2Type *V,
     CUTE_GRID_CONSTANT TiledCopyV const tmaLoadV, TileShapeV tileShapeV,
     GmemLayoutV gmemLayoutV, SmemLayoutV smemLayoutV, SmemLayoutVt smemLayoutVt,
     OutputType *O, CUTE_GRID_CONSTANT TiledCopyO const tmaStoreO,
@@ -142,11 +141,13 @@ fmhaForwardPipelinedWspl(
 #else
   // Just a dummy sS (with smem_v). It's required only for shape later.
   Tensor sS =
-      make_tensor(make_smem_ptr(reinterpret_cast<AccumType*>(shared_storage.smem_s.data())), smemLayoutS);
-      // make_tensor(make_smem_ptr(reinterpret_cast<AccumType*>(shared_storage.kv.smem_k.data()) + 0       ), smemLayoutS);
-  Tensor sR =
-      make_tensor(make_smem_ptr(reinterpret_cast<AccumType*>(shared_storage.smem_r.data())), smemLayoutS);
-      // make_tensor(make_smem_ptr(reinterpret_cast<AccumType*>(shared_storage.kv.smem_k.data()) + size(sS)), smemLayoutS);
+      make_tensor(make_smem_ptr(shared_storage.kv.smem_k.data()), smemLayoutS);
+  // Tensor sNocS =
+  //     make_tensor(make_smem_ptr(reinterpret_cast<cutlass::half_t*>(shared_storage.smem_s.data())), smemLayoutPS);
+  //     // make_tensor(make_smem_ptr(reinterpret_cast<cutlass::half_t*>(shared_storage.kv.smem_k.data()) + 0       ), smemLayoutPS);
+  // Tensor sNocR =
+  //     make_tensor(make_smem_ptr(reinterpret_cast<cutlass::half_t*>(shared_storage.smem_r.data())), smemLayoutPS);
+  //     // make_tensor(make_smem_ptr(reinterpret_cast<cutlass::half_t*>(shared_storage.kv.smem_k.data()) + size(sNocS)), smemLayoutPS);
 #endif
   Tensor sV =
       make_tensor(make_smem_ptr(shared_storage.kv.smem_v.data()), smemLayoutV);
@@ -193,6 +194,7 @@ fmhaForwardPipelinedWspl(
   // synchronization problem with the QINRMEM flag enabled.
   TiledMma0 tiledMma0;
   TiledMma1 tiledMma1;
+  TiledMmaCvt0 tiledMmaCvt0;
   auto threadMma0 = tiledMma0.get_thread_slice(threadIdx.x);
   auto threadMma1 = tiledMma1.get_thread_slice(threadIdx.x);
 
@@ -334,12 +336,19 @@ fmhaForwardPipelinedWspl(
       warpgroup_arrive();
 
       int stage = smem_pipe_read.index();
+      // NOTICE: This requires bM*bN*4 <= bN * headdim / SplitNum
+      Tensor sNocS =
+          make_tensor(make_smem_ptr(reinterpret_cast<cutlass::half_t*>(shared_storage.kv.smem_k.data()) 
+                                    + size(smemLayoutK(_,_,0)) * stage + 0          ), smemLayoutPS);
+      Tensor sNocR =
+          make_tensor(make_smem_ptr(reinterpret_cast<cutlass::half_t*>(shared_storage.kv.smem_k.data())
+                                    + size(smemLayoutK(_,_,0)) * stage + size(sNocS)), smemLayoutPS);
       fmhaForwardConsumer(Q, K, V, S, tSrQ, tSrK(_, _, _, stage), tSrS,
                           tOrV(_, _, _, stage), tOrO, tOrPLayout, reg2reg, rowMax,
                           rowSum, tileShapeS, gmemLayoutS, scale, blockIdxY++,
-                          tiledMma0, tiledMma1, 
+                          tiledMma0, tiledMma1, tiledMmaCvt0,
                           send_mbar_ptr, recv_mbar_ptr, 
-                          sS, sR, producer_phase, consumer_phase, AccumType(0), SoftType(0));
+                          sNocS, sNocR, producer_phase, consumer_phase, AccumType(0), SoftType(0));
       ++smem_pipe_read;
     }
     gemm_k_iterations -= mma_k_prologue;
@@ -351,12 +360,19 @@ fmhaForwardPipelinedWspl(
       warpgroup_arrive();
 
       int stage = smem_pipe_read.index();
+      // NOTICE: This requires bM*bN*4 <= bN * headdim / SplitNum
+      Tensor sNocS =
+          make_tensor(make_smem_ptr(reinterpret_cast<cutlass::half_t*>(shared_storage.kv.smem_k.data()) 
+                                    + size(smemLayoutK(_,_,0)) * stage + 0          ), smemLayoutPS);
+      Tensor sNocR =
+          make_tensor(make_smem_ptr(reinterpret_cast<cutlass::half_t*>(shared_storage.kv.smem_k.data())
+                                    + size(smemLayoutK(_,_,0)) * stage + size(sNocS)), smemLayoutPS);
       fmhaForwardConsumer(Q, K, V, S, tSrQ, tSrK(_, _, _, stage), tSrS,
                           tOrV(_, _, _, stage), tOrO, tOrPLayout, reg2reg, rowMax,
                           rowSum, tileShapeS, gmemLayoutS, scale, blockIdxY++,
-                          tiledMma0, tiledMma1, 
+                          tiledMma0, tiledMma1, tiledMmaCvt0,
                           send_mbar_ptr, recv_mbar_ptr,
-                          sS, sR, producer_phase, consumer_phase, AccumType(0), SoftType(0));
+                          sNocS, sNocR, producer_phase, consumer_phase, AccumType(0), SoftType(0));
 
       warpgroup_wait<2 * K_PIPE_MMAS>();
       //    warpgroup_fence_operand(tSrS);

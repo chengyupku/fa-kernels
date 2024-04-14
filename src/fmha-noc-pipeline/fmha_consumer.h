@@ -6,25 +6,23 @@
 #include "noc_config.h"
 #include "utils.h"
 
+using SmemType = cutlass::half_t;
+
 // FMHA Consumer does GEMMs and softmax
 template <class Gemm1Type, class AccumType, class SoftType, class Gemm2Type,
-          class TiledMma0, class TiledMma1, class TileShapeS, class GmemLayoutS,
-          typename TensorQ, typename TensorK, typename TensorS,
+          class TiledMma0, class TiledMma1, class TiledMmaCvt0, class TileShapeS, 
+          class GmemLayoutS, typename TensorQ, typename TensorK, typename TensorS,
           typename TensorV, typename TensorO, typename TensorSS, typename TensorSR,
           typename RegLayout, typename Reg2Reg,
           typename RowMax, typename RowSum, typename FullBarrier, typename EmptyBarrier>
 __device__ static void //__launch_bounds__(128, 2)
-fmhaForwardConsumer(Gemm1Type const *Q, Gemm1Type const *K, Gemm2Type const *V,
-                    Gemm1Type *S, const TensorQ &tSrQ, const TensorK &tSrK,
-                    TensorS &&tSrS, const TensorV &tOrV, TensorO &tOrO,
+fmhaForwardConsumer(Gemm1Type const *Q, Gemm1Type const *K, Gemm2Type const *V, Gemm1Type *S, 
+                    const TensorQ &tSrQ, const TensorK &tSrK, TensorS &&tSrS, const TensorV &tOrV, TensorO &tOrO,
                     const RegLayout &tOrPLayout, Reg2Reg & reg2reg, RowMax &rowMax, RowSum &rowSum,
-                    const TileShapeS &tileShapeS,
-                    const GmemLayoutS &gmemLayoutS, float scale, int blockIdxY,
-                    const TiledMma0 &tiledMma0, const TiledMma1 &tiledMma1,
-                    FullBarrier* send_mbar_ptr, EmptyBarrier* recv_mbar_ptr,
-                    TensorSS& sS, TensorSR& sR,
-                    uint32_t& producer_phase, uint32_t& consumer_phase,
-                    const AccumType &, const SoftType &) {
+                    const TileShapeS &tileShapeS, const GmemLayoutS &gmemLayoutS, float scale, int blockIdxY,
+                    const TiledMma0 &tiledMma0, const TiledMma1 &tiledMma1, const TiledMmaCvt0 &tiledMmaCvt0,
+                    FullBarrier* send_mbar_ptr, EmptyBarrier* recv_mbar_ptr, TensorSS& sNocS, TensorSR& sNocR,
+                    uint32_t& producer_phase, uint32_t& consumer_phase, const AccumType &, const SoftType &) {
 
   using namespace cute;
 
@@ -56,18 +54,23 @@ fmhaForwardConsumer(Gemm1Type const *Q, Gemm1Type const *K, Gemm2Type const *V,
       noc::arrive_empty(recv_mbar_ptr, src_id);
     }
 
-    Tensor tSsS = threadMma0.partition_C(sS(_,_,0));
-    Tensor tSsR = threadMma0.partition_C(sR(_,_,0));
-    copy(tSrS, tSsS);
+    using CopyAtomC = Copy_Atom<SM90_U32x4_STSM_N, cutlass::half_t>;
+    TiledCopy tiled_copy_C_atom = make_tiled_copy_C_atom(CopyAtomC{}, tiledMmaCvt0);
+    TiledCopy tiled_r2s = make_tiled_copy_S(Copy_Atom<SM90_U32x4_STSM_N,SmemType>{}, tiled_copy_C_atom);
+    ThrCopy thread_r2s = tiled_r2s.get_slice(threadIdx.x % size(tiledMma0));
+    Tensor tRS_sS   = thread_r2s.partition_D(sNocS);                                       // (R2S,R2S_M,R2S_N,PIPE_D)
+    Layout tRS_rS_layout = make_layout(take<0,3>(shape(thread_r2s.partition_S(sNocS))));
+    Tensor tRS_rS = make_tensor(make_smem_ptr(reinterpret_cast<SmemType*>(tSrS.data())), tRS_rS_layout);                                          // (R2S,R2S_M,R2S_N)
+    copy(tiled_r2s, tRS_rS, tRS_sS);
     synchronize();
 
     // Send local (partial) acc_s to neighbour
     // cluster.sync();
     if (threadIdx.x == 128) {
-      uint32_t transaction_bytes = size(sS(_,_,0)) * sizeof(AccumType)/*sizeof float*/;
-      uint32_t src_int_addr = cast_smem_ptr_to_uint(sS(_,_,0).data().get().get());
+      uint32_t transaction_bytes = size(sNocS) * sizeof(SmemType);
+      uint32_t src_int_addr = cast_smem_ptr_to_uint(sNocS.data().get().get());
       uint32_t smem_int_mbar = set_block_rank(cast_smem_ptr_to_uint(send_mbar_ptr), dst_id);
-      uint32_t remote_addr = set_block_rank(cast_smem_ptr_to_uint(sR(_,_,0).data().get().get()), dst_id);
+      uint32_t remote_addr = set_block_rank(cast_smem_ptr_to_uint(sNocR.data().get().get()), dst_id);
       noc::wait_empty(recv_mbar_ptr, producer_phase);
       producer_phase ^= 1;
       noc::dsmem_copy_prepare(send_mbar_ptr, transaction_bytes, dst_id);
@@ -81,13 +84,16 @@ fmhaForwardConsumer(Gemm1Type const *Q, Gemm1Type const *K, Gemm2Type const *V,
     synchronize();
 
     Tensor tSrR = make_fragment_like(tSrS);
-    copy(tSsR, tSrR);
+    TiledCopy tiled_s2r = make_tiled_copy_S(Copy_Atom<SM75_U32x4_LDSM_N, SmemType>{}, tiled_copy_C_atom);
+    ThrCopy thread_s2r = tiled_s2r.get_slice(threadIdx.x % size(tiledMma0));
+    Tensor tSR_sC = thread_s2r.partition_S(sNocR);
+    Tensor tRS_rC = make_tensor(make_smem_ptr(reinterpret_cast<SmemType*>(tSrR.data())), tRS_rS_layout);
+    Tensor tSR_rC = thread_s2r.retile_D(tRS_rC);
+    copy(tiled_s2r, tSR_sC, tSR_rC);
     synchronize();
     
     Tensor A = flatten(make_tensor(tSrS(_,0,0).data(), tSrS(_,0,0).layout()));
     Tensor B = flatten(make_tensor(tSrR(_,0,0).data(), tSrR(_,0,0).layout()));
-    // if (cute::thread0()) {print("A:"); print(A.layout()); print("\n");}
-    // if (cute::thread0()) {print("B:"); print(B.layout()); print("\n");}
     noc::reduce_in_place(A, B);
     synchronize();
   }

@@ -103,6 +103,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   // Define TileShapes
   using bM = Int<kQueriesPerBlock>;
   using bN = Int<kKeysPerBlock>;
+  using bN_cvt = Int<kKeysPerBlock * 2>;
   using bK = Int<HEADDIM>;
   using bKblock = Int<HEADDIM / SplitNum>;
 #if EXECMODE == 2
@@ -175,13 +176,24 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   //     cute::conditional_return<is_same_v<MmaA, cutlass::half_t>>(
   //         getSmemLayoutK<MmaA, bN{}>(), GMMA::Layout_K_INTER_Atom<MmaA>{});
 
-  auto smemLayoutAtomS = GMMA::Layout_K_SW128_Atom<MmaC>{};
-  // auto smemLayoutS = tile_to_shape(
-  //     smemLayoutAtomS,
-  //     make_shape(shape<0>(tileShapeS), shape<1>(tileShapeS), STAGES()));
+  // auto tileShapeSR = make_shape(bM{}, bN_cvt{});
+  // auto smemLayoutAtomSR = GMMA::Layout_K_SW128_Atom<cutlass::half_t>{};
+  // auto smemLayoutPS = tile_to_shape(
+  //     smemLayoutAtomSR,
+  //     make_shape(shape<0>(tileShapeSR), shape<1>(tileShapeSR), _1{}));
+  auto smemLayoutPS =
+      tile_to_shape(GMMA::Layout_K_SW128_Atom<cutlass::half_t>{}, make_shape(bM{}, bN_cvt{}));
+
+  // auto smemLayoutAtomS = GMMA::Layout_K_SW128_Atom<MmaC>{};
+  auto smemLayoutAtomS =
+      cute::conditional_return<is_same_v<MmaA, cutlass::half_t>>(
+          getSmemLayoutK<MmaA, bN{}>(), GMMA::Layout_K_INTER_Atom<MmaA>{});
   auto smemLayoutS = tile_to_shape(
       smemLayoutAtomS,
-      make_shape(shape<0>(tileShapeS), shape<1>(tileShapeS), _1{}));
+      make_shape(shape<0>(tileShapeS), shape<1>(tileShapeS), STAGES()));
+  // auto smemLayoutS = tile_to_shape(
+  //     smemLayoutAtomS,
+  //     make_shape(shape<0>(tileShapeS), shape<1>(tileShapeS), _1{}));
 
 // We assume V is NOT transposed in memory by default.
 // For now, if we enable V FP8, then we will also transpose V offline.
@@ -275,6 +287,9 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   using TiledMma0 = decltype(cute::make_tiled_mma(
       ss_op_selector_custom<MmaA, MmaB, MmaC, Shape<bM, bN, bKblock>>(),
       MmaTileShape{}));
+  using TiledMmaCvt0 = decltype(cute::make_tiled_mma(
+      ss_op_selector_custom<MmaA, MmaB, MmaC, Shape<bM, bN_cvt, bKblock>>(),
+      MmaTileShape{}));
 #endif
 
 #ifdef SINSMEM
@@ -317,12 +332,12 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   std::cout << "EXECMODE == 1" << std::endl;
   // Get the ptr to kernel function.
   void const *kernel = (void const *)fmhaForwardPipelinedWspl<
-      PrecType, MmaC, SoftType, Mma2A, OutputType, TiledMma0, TiledMma1,
+      PrecType, MmaC, SoftType, Mma2A, OutputType, TiledMma0, TiledMma1, TiledMmaCvt0,
       decltype(tmaQ), decltype(tileShapeQ), decltype(gmemLayoutQ),
       decltype(smemLayoutQ), decltype(tmak), decltype(tileShapeK),
       decltype(gmemLayoutK), decltype(smemLayoutK), decltype(tileShapeS),
-      decltype(gmemLayoutS), decltype(smemLayoutS), decltype(tmaV),
-      decltype(tileShapeV), decltype(gmemLayoutV), decltype(smemLayoutV),
+      decltype(gmemLayoutS), decltype(smemLayoutS), decltype(smemLayoutPS),
+      decltype(tmaV), decltype(tileShapeV), decltype(gmemLayoutV), decltype(smemLayoutV),
       decltype(smemLayoutVt), decltype(tmaO), decltype(tileShapeO),
       decltype(gmemLayoutO), decltype(smemLayoutO), decltype(gmemLayoutMi),
       ClusterShape>;
@@ -385,7 +400,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
     cutlass::Status status = cutlass::launch_kernel_on_cluster(
         params, kernel, ptrQ, tmaQ, tileShapeQ, gmemLayoutQ, smemLayoutQ, ptrK,
         tmak, tileShapeK, gmemLayoutK, smemLayoutK, tensorS, tileShapeS,
-        gmemLayoutS, smemLayoutS, nTilesOfK, tensorV, tmaV, tileShapeV,
+        gmemLayoutS, smemLayoutS, smemLayoutPS, nTilesOfK, tensorV, tmaV, tileShapeV,
         gmemLayoutV, smemLayoutV, smemLayoutVt, tensorO, tmaO, tileShapeO,
         gmemLayoutO, smemLayoutO, miOut, sPrimeOut, gmemLayoutMi, scale);     
   }
