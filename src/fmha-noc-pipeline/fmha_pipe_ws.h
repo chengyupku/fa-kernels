@@ -124,10 +124,13 @@ fmhaForwardPipelinedWspl(
   Tensor mQ = tmaLoadQ.get_tma_tensor(shape(gmemLayoutQ));
 
   // Compute TMA transaction bytes
-  constexpr int per_cta_bytes =
-      size(tileShapeK) * sizeof_bits_v<Gemm1Type> / 8 +
-      size(tileShapeV) * sizeof_bits_v<Gemm2Type> / 8;
-  uint32_t const TmaTransactionBytes = per_cta_bytes * NumProducers;
+  // constexpr int per_cta_bytes =
+  //     size(tileShapeK) * sizeof_bits_v<Gemm1Type> / 8 +
+  //     size(tileShapeV) * sizeof_bits_v<Gemm2Type> / 8;
+  constexpr int per_cta_bytes_k = size(tileShapeK) * sizeof_bits_v<Gemm1Type> / 8;
+  constexpr int per_cta_bytes_v = size(tileShapeV) * sizeof_bits_v<Gemm2Type> / 8;
+  uint32_t const TmaTransactionBytesK = per_cta_bytes_k * NumProducers;
+  uint32_t const TmaTransactionBytesV = per_cta_bytes_v * NumProducers;
 
   // Construct SMEM tensors.
   Tensor sQ =
@@ -232,7 +235,8 @@ fmhaForwardPipelinedWspl(
 
   // mbarrier.init
   typename MainloopPipeline::Params params;
-  params.transaction_bytes = TmaTransactionBytes;
+  params.transaction_bytes[eK] = TmaTransactionBytesK;
+  params.transaction_bytes[eV] = TmaTransactionBytesV;
   if (warp_group_idx == 0) {
     params.role = MainloopPipeline::ThreadCategory::Producer;
   } else {
@@ -284,23 +288,27 @@ fmhaForwardPipelinedWspl(
           make_producer_start_state<MainloopPipeline>();
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < tma_k_prologue; ++i) {
-        pipeline.producer_acquire(smem_pipe_write);
-        BarrierType *tmaBar = pipeline.producer_get_barrier(smem_pipe_write);
+        pipeline.producer_acquire(smem_pipe_write, eK);
+        pipeline.producer_acquire(smem_pipe_write, eV);
+        BarrierType *tmaBarK = pipeline.producer_get_barrier(smem_pipe_write, eK);
+        BarrierType *tmaBarV = pipeline.producer_get_barrier(smem_pipe_write, eV);
         fmhaForwardProducer(sK(_, _, i), tmaLoadK, tileShapeK, gmemLayoutK,
                             sV(_, _, i), tmaLoadV, tileShapeV, gmemLayoutV,
-                            blockIdxY++, tmaBar, ClusterShape());
+                            blockIdxY++, tmaBarK, tmaBarV, ClusterShape());
         ++smem_pipe_write;
       }
       int tma_k_iter = nTilesOfK - tma_k_prologue;
 
       CUTE_NO_UNROLL
       for (; tma_k_iter > 0; --tma_k_iter) {
-        pipeline.producer_acquire(smem_pipe_write);
-        BarrierType *tmaBar = pipeline.producer_get_barrier(smem_pipe_write);
+        pipeline.producer_acquire(smem_pipe_write, eK);
+        pipeline.producer_acquire(smem_pipe_write, eV);
+        BarrierType *tmaBarK = pipeline.producer_get_barrier(smem_pipe_write, eK);
+        BarrierType *tmaBarV = pipeline.producer_get_barrier(smem_pipe_write, eV);
         auto stage = smem_pipe_write.index();
         fmhaForwardProducer(sK(_, _, stage), tmaLoadK, tileShapeK, gmemLayoutK,
                             sV(_, _, stage), tmaLoadV, tileShapeV, gmemLayoutV,
-                            blockIdxY++, tmaBar, ClusterShape());
+                            blockIdxY++, tmaBarK, tmaBarV, ClusterShape());
         ++smem_pipe_write;
       }
 
@@ -309,7 +317,8 @@ fmhaForwardPipelinedWspl(
       PipelineState tail =
           tma_k_prologue == stageCount ? smem_pipe_write : PipelineState{};
       for (int i = 0; i < tma_k_prologue; ++i) {
-        pipeline.producer_acquire(tail);
+        pipeline.producer_acquire(tail, eK);
+        pipeline.producer_acquire(tail, eV);
         ++tail;
       }
     }
@@ -334,7 +343,8 @@ fmhaForwardPipelinedWspl(
 
     CUTLASS_PRAGMA_UNROLL
     for (int iter = 0; iter < mma_k_prologue; ++iter) {
-      pipeline.consumer_wait(smem_pipe_read);
+      pipeline.consumer_wait(smem_pipe_read, eK);
+      pipeline.consumer_wait(smem_pipe_read, eV);
       warpgroup_arrive();
 
       int stage = smem_pipe_read.index();
@@ -358,7 +368,8 @@ fmhaForwardPipelinedWspl(
     CUTLASS_PRAGMA_NO_UNROLL
     for (; gemm_k_iterations > 0; --gemm_k_iterations) {
       /// Wait on the smem_pipe_read stage / phase
-      pipeline.consumer_wait(smem_pipe_read);
+      pipeline.consumer_wait(smem_pipe_read, eK);
+      pipeline.consumer_wait(smem_pipe_read, eV);
       warpgroup_arrive();
 
       int stage = smem_pipe_read.index();
@@ -380,7 +391,8 @@ fmhaForwardPipelinedWspl(
       //    warpgroup_fence_operand(tSrS);
       //    warpgroup_fence_operand(tOrO);
 
-      pipeline.consumer_release_self(smem_pipe_release);
+      pipeline.consumer_release_self(smem_pipe_release, eK);
+      pipeline.consumer_release_self(smem_pipe_release, eV);
 
       // Advance stages
       ++smem_pipe_read;
@@ -390,7 +402,8 @@ fmhaForwardPipelinedWspl(
     warpgroup_wait<0>();
     // Tail Loop
     for (int i = 0; i < K_PIPE_MMAS; ++i) {
-      pipeline.consumer_release_self(smem_pipe_release);
+      pipeline.consumer_release_self(smem_pipe_release, eK);
+      pipeline.consumer_release_self(smem_pipe_release, eV);
       ++smem_pipe_release;
     }
 

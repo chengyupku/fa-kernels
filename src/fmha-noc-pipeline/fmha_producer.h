@@ -13,7 +13,9 @@ fmhaForwardProducer(Tensor<TensorEngineK, SmemLayoutK> &&sK,
                     GmemLayoutK gmemLayoutK,
                     Tensor<TensorEngineV, SmemLayoutV> &&sV,
                     TiledCopyV const &tmaLoadV, TileShapeV tileShapeV,
-                    GmemLayoutV gmemLayoutV, int blockIdxY, BarrierType *tmaBar, const ClusterShape &) {
+                    GmemLayoutV gmemLayoutV, int blockIdxY, 
+                    BarrierType *tmaBarK, BarrierType *tmaBarV, 
+                    const ClusterShape &) {
 
   using namespace cute;
 
@@ -82,6 +84,6 @@ fmhaForwardProducer(Tensor<TensorEngineK, SmemLayoutK> &&sK,
 
   // Copy current tiles of V and K from GMEM to SMEM.
   // Uses TMA multicast for CLUSTERN>1
-  copy(tmaLoadK.with(*tmaBar, mcast_mask_a), tKgK(_, 0), tKsK(_, 0));
-  copy(tmaLoadV.with(*tmaBar, mcast_mask_a), tVgV(_, 0), tVsV(_, 0));
+  copy(tmaLoadK.with(*tmaBarK, mcast_mask_a), tKgK(_, 0), tKsK(_, 0));
+  copy(tmaLoadV.with(*tmaBarV, mcast_mask_a), tVgV(_, 0), tVsV(_, 0));
 }

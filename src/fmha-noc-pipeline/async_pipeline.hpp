@@ -1,6 +1,8 @@
 #pragma once
 #include "cutlass/pipeline/pipeline.hpp"
 
+#define eK 0
+#define eV 1
 namespace cutlass {
 
 using namespace cute;
@@ -16,8 +18,8 @@ public :
   using PipelineState = cutlass::PipelineState<Stages>;
 
   struct SharedStorage {
-    FullBarrier full_barrier_[Stages];
-    EmptyBarrier empty_barrier_[Stages];
+    FullBarrier full_barrier_[2][Stages];
+    EmptyBarrier empty_barrier_[2][Stages];
   };
 
   enum class ThreadCategory {
@@ -28,7 +30,7 @@ public :
   };
 
   struct Params {
-    uint32_t transaction_bytes = 0;
+    uint32_t transaction_bytes[2] = {0};
     ThreadCategory role = ThreadCategory::NonParticipant;
     uint32_t is_leader = 0;
     uint32_t num_consumers = 0;
@@ -39,8 +41,8 @@ public :
   CUTLASS_DEVICE
   PipelineTmaNoCAsync(SharedStorage& storage, Params params, ClusterShape cluster_shape)
       : params_(params)
-      , full_barrier_ptr_(&storage.full_barrier_[0])
-      , empty_barrier_ptr_(&storage.empty_barrier_[0]) {
+      , full_barrier_ptr_(storage.full_barrier_)
+      , empty_barrier_ptr_(storage.empty_barrier_) {
 
     int warp_idx = canonical_warp_idx();
     int lane_predicate = cute::elect_one_sync();
@@ -48,14 +50,16 @@ public :
     if (warp_idx == 0 && lane_predicate == 1) {
       // Barrier FULL init
       for (int i = 0; i < Stages; ++i) {
-        full_barrier_ptr_[i].init(1);
+        full_barrier_ptr_[eK][i].init(1);
+        full_barrier_ptr_[eV][i].init(1);
       }
       uint32_t const num_consumer_warpgroups_per_cluster = params_.num_consumers / NumThreadsPerWarpGroup;
       uint32_t const multicast_consumer_arrival_count = (cute::size<0>(cluster_shape) + cute::size<1>(cluster_shape) - 1) *
           num_consumer_warpgroups_per_cluster;
       // Barrier EMPTY init
       for (int i = 0; i < Stages; ++i) {
-        empty_barrier_ptr_[i].init(multicast_consumer_arrival_count);
+        empty_barrier_ptr_[eK][i].init(multicast_consumer_arrival_count);
+        empty_barrier_ptr_[eV][i].init(multicast_consumer_arrival_count);
       }
     }
     cutlass::arch::fence_barrier_init();
@@ -126,14 +130,14 @@ public :
   // then it is still correct to pass it into the finalize function.
   // The finalize function will return immediately in that case.
 
-  CUTLASS_DEVICE
-  ProducerToken producer_try_acquire(PipelineState state, uint32_t skip_wait = false) {
-    return producer_try_acquire(state.index(), state.phase(), skip_wait);
-  }
+  // CUTLASS_DEVICE
+  // ProducerToken producer_try_acquire(PipelineState state, uint32_t skip_wait = false) {
+  //   return producer_try_acquire(state.index(), state.phase(), skip_wait);
+  // }
 
   CUTLASS_DEVICE
-  void producer_acquire(PipelineState state, ProducerToken barrier_token = {BarrierStatus::WaitAgain}) {
-    producer_acquire(state.index(), state.phase(), barrier_token);
+  void producer_acquire(PipelineState state, uint32_t var, ProducerToken barrier_token = {BarrierStatus::WaitAgain}) {
+    producer_acquire(state.index(), state.phase(), barrier_token, var);
   }
 
   CUTLASS_DEVICE
@@ -146,76 +150,77 @@ public :
   CUTLASS_DEVICE
   void producer_tail(PipelineState state) {
     for (int count = 0; count < Stages; ++count) {
-      producer_acquire(state, {BarrierStatus::WaitOnly});  
+      producer_acquire(state, eK, {BarrierStatus::WaitOnly});  
+      producer_acquire(state, eV, {BarrierStatus::WaitOnly});  
       ++state;
     }
   }
 
   CUTLASS_DEVICE
-  ProducerBarrierType* producer_get_barrier(PipelineState state) {
-    return producer_get_barrier(state.index());
+  ProducerBarrierType* producer_get_barrier(PipelineState state, uint32_t var) {
+    return producer_get_barrier(state.index(), var);
   }
 
   ////////////////////
   // Consumer APIs
   ////////////////////
   CUTLASS_DEVICE
-  ConsumerToken consumer_try_wait(PipelineState state, uint32_t skip_wait = false) {
-    return consumer_try_wait(state.index(), state.phase(), skip_wait);
+  ConsumerToken consumer_try_wait(PipelineState state, uint32_t var, uint32_t skip_wait = false) {
+    return consumer_try_wait(state.index(), state.phase(), skip_wait, var);
   }
 
   CUTLASS_DEVICE
-  ConsumerToken consumer_test_wait(PipelineState state, uint32_t skip_wait = false) {
-    return consumer_test_wait(state.index(), state.phase(), skip_wait);
+  ConsumerToken consumer_test_wait(PipelineState state, uint32_t var, uint32_t skip_wait = false) {
+    return consumer_test_wait(state.index(), state.phase(), skip_wait, var);
   }
   
   CUTLASS_DEVICE
-  void consumer_wait(PipelineState state) {
-    consumer_wait(state.index(), state.phase());
+  void consumer_wait(PipelineState state, uint32_t var) {
+    consumer_wait(state.index(), state.phase(), var);
   }
 
   CUTLASS_DEVICE
-  void consumer_wait(PipelineState state, ConsumerToken barrier_token) {
-    consumer_wait(state.index(), state.phase(), barrier_token);
+  void consumer_wait(PipelineState state, ConsumerToken barrier_token, uint32_t var) {
+    consumer_wait(state.index(), state.phase(), barrier_token, var);
   }
 
   CUTLASS_DEVICE
-  void consumer_release(PipelineState state) {
-    consumer_release(state.index());
+  void consumer_release(PipelineState state, uint32_t var) {
+    consumer_release(state.index(), var);
   }
 
   CUTLASS_DEVICE
-  void consumer_release_self(PipelineState state) {
-    consumer_release_self(state.index());
+  void consumer_release_self(PipelineState state, uint32_t var) {
+    consumer_release_self(state.index(), var);
   }
 
 private :
   uint32_t dst_blockid_ = 0;
   uint32_t is_signalling_thread_ = 0;
-  FullBarrier *full_barrier_ptr_ = nullptr;
-  EmptyBarrier *empty_barrier_ptr_ = nullptr;
+  FullBarrier (*full_barrier_ptr_)[Stages] = nullptr;
+  EmptyBarrier (*empty_barrier_ptr_)[Stages] = nullptr;
   Params params_;
 
-  CUTLASS_DEVICE
-  ProducerToken producer_try_acquire(uint32_t stage, uint32_t phase, uint32_t skip_wait) {
-    if (skip_wait) {
-      return {BarrierStatus::WaitDone};
-    }
-    uint32_t barrier_status = empty_barrier_ptr_[stage].try_wait(phase);
-    return {static_cast<BarrierStatus>(barrier_status)};
-  }
+  // CUTLASS_DEVICE
+  // ProducerToken producer_try_acquire(uint32_t stage, uint32_t phase, uint32_t skip_wait) {
+  //   if (skip_wait) {
+  //     return {BarrierStatus::WaitDone};
+  //   }
+  //   uint32_t barrier_status = empty_barrier_ptr_[stage].try_wait(phase);
+  //   return {static_cast<BarrierStatus>(barrier_status)};
+  // }
 
   CUTLASS_DEVICE
-  void producer_acquire(uint32_t stage, uint32_t phase, ProducerToken barrier_token) {
+  void producer_acquire(uint32_t stage, uint32_t phase, ProducerToken barrier_token, uint32_t var) {
     if (barrier_token != BarrierStatus::WaitDone) {
-      empty_barrier_ptr_[stage].wait(phase);
+      empty_barrier_ptr_[var][stage].wait(phase);
     }
     if (barrier_token == BarrierStatus::WaitOnly) {
       return;
     }
 
     if (params_.is_leader) {
-      full_barrier_ptr_[stage].arrive_and_expect_tx(params_.transaction_bytes);
+      full_barrier_ptr_[var][stage].arrive_and_expect_tx(params_.transaction_bytes[var]);
     }
     #ifndef NDEBUG
     if (params_.role == ThreadCategory::Consumer || params_.role == ThreadCategory::NonParticipant) {
@@ -259,42 +264,42 @@ private :
   }
 
   CUTLASS_DEVICE
-  ConsumerToken consumer_try_wait(uint32_t stage, uint32_t phase, uint32_t skip_wait) {
+  ConsumerToken consumer_try_wait(uint32_t stage, uint32_t phase, uint32_t skip_wait, uint32_t var) {
     if (skip_wait) {
       return {BarrierStatus::WaitDone};
     }
-    uint32_t barrier_status = full_barrier_ptr_[stage].try_wait(phase);
+    uint32_t barrier_status = full_barrier_ptr_[var][stage].try_wait(phase);
     return {static_cast<BarrierStatus>(barrier_status)};
   }
 
   CUTLASS_DEVICE
-  ConsumerToken consumer_test_wait(uint32_t stage, uint32_t phase, uint32_t skip_wait) {
+  ConsumerToken consumer_test_wait(uint32_t stage, uint32_t phase, uint32_t skip_wait, uint32_t var) {
     if (skip_wait) {
       return {BarrierStatus::WaitDone};
     }
-    uint32_t barrier_status = full_barrier_ptr_[stage].test_wait(phase);
+    uint32_t barrier_status = full_barrier_ptr_[var][stage].test_wait(phase);
     return {static_cast<BarrierStatus>(barrier_status)};
   }
   
   // Wait for producer to commit transactions (done by TMA)
   CUTLASS_DEVICE
-  void consumer_wait(uint32_t stage, uint32_t phase) {
-    full_barrier_ptr_[stage].wait(phase);
+  void consumer_wait(uint32_t stage, uint32_t phase, uint32_t var) {
+    full_barrier_ptr_[var][stage].wait(phase);
   }
 
   // Wait for producer to commit transactions (done by TMA)
   CUTLASS_DEVICE
-  void consumer_wait(uint32_t stage, uint32_t phase, ConsumerToken barrier_token) {
+  void consumer_wait(uint32_t stage, uint32_t phase, ConsumerToken barrier_token, uint32_t var) {
     if (barrier_token == BarrierStatus::WaitAgain) {
-      full_barrier_ptr_[stage].wait(phase);
+      full_barrier_ptr_[var][stage].wait(phase);
     }
   }
 
   // Consumer signalling Producer of completion
   // Ensures all blocks in the Same Row and Column get notifed.
   CUTLASS_DEVICE
-  void consumer_release(uint32_t stage, uint32_t skip = false) {
-    empty_barrier_ptr_[stage].arrive(dst_blockid_, is_signalling_thread_ & (!skip));
+  void consumer_release(uint32_t stage, uint32_t var, uint32_t skip = false) {
+    empty_barrier_ptr_[var][stage].arrive(dst_blockid_, is_signalling_thread_ & (!skip));
     #ifndef NDEBUG
     if (params_.role == ThreadCategory::Producer || params_.role == ThreadCategory::NonParticipant) {
       asm volatile ("brkpt;\n" ::);
@@ -304,9 +309,9 @@ private :
 
   // Only arrive self-block, not support multicast
   CUTLASS_DEVICE
-  void consumer_release_self(uint32_t stage, uint32_t skip = false) {
+  void consumer_release_self(uint32_t stage, uint32_t var, uint32_t skip = false) {
     if ((!skip) && (threadIdx.x % NumThreadsPerWarpGroup == 0)) {
-      empty_barrier_ptr_[stage].arrive();
+      empty_barrier_ptr_[var][stage].arrive();
     }
     #ifndef NDEBUG
     if (params_.role == ThreadCategory::Producer || params_.role == ThreadCategory::NonParticipant) {
@@ -316,8 +321,8 @@ private :
   }
 
   CUTLASS_DEVICE
-  ProducerBarrierType* producer_get_barrier(uint32_t stage) {
-    return reinterpret_cast<ProducerBarrierType*>(&full_barrier_ptr_[stage]);
+  ProducerBarrierType* producer_get_barrier(uint32_t stage, uint32_t var) {
+    return reinterpret_cast<ProducerBarrierType*>(&full_barrier_ptr_[var][stage]);
   }
 };
 
