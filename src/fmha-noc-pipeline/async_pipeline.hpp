@@ -102,7 +102,7 @@ public:
   }
 };
 
-template <int Stages_>
+template <int Stages_, int PatternLen_>
 class PipelineTmaNoCAsync {
 public :
   using FullBarrier = cutlass::arch::ClusterTransactionBarrier;
@@ -111,14 +111,16 @@ public :
   using ProducerBarrierType = FullBarrier::ValueType;
   using ConsumerBarrierType = EmptyBarrier::ValueType;
   static constexpr uint32_t Stages = Stages_;
-  using PipelineState = cutlass::PipelineState<Stages>;
+  static constexpr uint32_t PatternLen = PatternLen_;
+  using PhysicalPipelineState = cutlass::PipelineState<Stages>;
+  using LogicalPipelineState  = cutlass::PipelineState<PatternLen>;
 
   struct SharedStorage {
-    FullBarrier full_barrier_[2][Stages];
+    FullBarrier full_barrier_[2][PatternLen];
     EmptyBarrier empty_barrier_[2][Stages];
-    SignalBarrier can_send_barrier_[2][Stages];
-    SignalBarrier copy_finish_barrier_[2][Stages];
-    SignalBarrier syncs_barrier_[2][Stages];
+    SignalBarrier can_send_barrier_[2][PatternLen];
+    SignalBarrier copy_finish_barrier_[2][PatternLen];
+    SignalBarrier syncs_barrier_[2][PatternLen];
     SignalBarrier mma_finish_barrier_[1];
   };
 
@@ -153,7 +155,7 @@ public :
 
     if (warp_idx == 0 && lane_predicate == 1) {
       // Barrier FULL init
-      for (int i = 0; i < Stages; ++i) {
+      for (int i = 0; i < PatternLen; ++i) {
         full_barrier_ptr_[eK][i].init(1);
         full_barrier_ptr_[eV][i].init(1);
       }
@@ -165,15 +167,15 @@ public :
         empty_barrier_ptr_[eK][i].init(multicast_consumer_arrival_count);
         empty_barrier_ptr_[eV][i].init(multicast_consumer_arrival_count);
       }
-      for (int i = 0; i < Stages; ++i) {
+      for (int i = 0; i < PatternLen; ++i) {
         can_send_barrier_ptr_[eK][i].init(num_consumer_warpgroups_per_cluster);
         can_send_barrier_ptr_[eV][i].init(num_consumer_warpgroups_per_cluster);
       }
-      for (int i = 0; i < Stages; ++i) {
+      for (int i = 0; i < PatternLen; ++i) {
         copy_finish_barrier_ptr_[eK][i].init(1);
         copy_finish_barrier_ptr_[eV][i].init(1);
       }
-      for (int i = 0; i < Stages; ++i) {
+      for (int i = 0; i < PatternLen; ++i) {
         syncs_barrier_ptr_[eK][i].init(1);
         syncs_barrier_ptr_[eV][i].init(1);
       }
@@ -251,18 +253,18 @@ public :
   //   return producer_try_acquire(state.index(), state.phase(), skip_wait);
   // }
 
-  CUTLASS_DEVICE
-  void producer_acquire(PipelineState state, uint32_t var, ProducerToken barrier_token = {BarrierStatus::WaitAgain}) {
-    producer_acquire(state.index(), state.phase(), barrier_token, var);
-  }
+  // CUTLASS_DEVICE
+  // void producer_acquire(PipelineState state, uint32_t var, ProducerToken barrier_token = {BarrierStatus::WaitAgain}) {
+  //   producer_acquire(state.index(), state.phase(), barrier_token, var);
+  // }
 
   CUTLASS_DEVICE
-  void wait_empty(PipelineState state, uint32_t var) {
+  void wait_empty(PhysicalPipelineState state, uint32_t var) {
     empty_barrier_ptr_[var][state.index()].wait(state.phase());
   }
 
   CUTLASS_DEVICE
-  void copy_prepare(PipelineState state, uint32_t var, uint32_t transaction_bytes = 0, bool no_trans = false) {
+  void copy_prepare(LogicalPipelineState state, uint32_t var, uint32_t transaction_bytes = 0, bool no_trans = false) {
     if (params_.is_leader) {
       if (transaction_bytes == 0) {
         transaction_bytes = params_.transaction_bytes[var];
@@ -280,7 +282,7 @@ public :
   }
   
   CUTLASS_DEVICE
-  void sender_wait_receiver_ready(SeparatePipelineState<Stages> state, uint32_t var) {
+  void sender_wait_receiver_ready(SeparatePipelineState<PatternLen> state, uint32_t var) {
     can_send_barrier_ptr_[var][state.index()].wait(state.phase());
   }
 
@@ -337,24 +339,24 @@ public :
     return producer_get_barrier(stage, var);
   }
 
-  CUTLASS_DEVICE
-  void producer_commit(PipelineState state, uint32_t bytes) {
-    producer_commit(state.index(), bytes);
-  }
+  // CUTLASS_DEVICE
+  // void producer_commit(PipelineState state, uint32_t bytes) {
+  //   producer_commit(state.index(), bytes);
+  // }
 
-  // Prevents early exit of producer blocks in Cluster.
-  // This should be called once before kernel exits.
-  CUTLASS_DEVICE
-  void producer_tail(PipelineState state) {
-    for (int count = 0; count < Stages; ++count) {
-      producer_acquire(state, eK, {BarrierStatus::WaitOnly});  
-      producer_acquire(state, eV, {BarrierStatus::WaitOnly});  
-      ++state;
-    }
-  }
+  // // Prevents early exit of producer blocks in Cluster.
+  // // This should be called once before kernel exits.
+  // CUTLASS_DEVICE
+  // void producer_tail(PipelineState state) {
+  //   for (int count = 0; count < Stages; ++count) {
+  //     producer_acquire(state, eK, {BarrierStatus::WaitOnly});  
+  //     producer_acquire(state, eV, {BarrierStatus::WaitOnly});  
+  //     ++state;
+  //   }
+  // }
 
   CUTLASS_DEVICE
-  ProducerBarrierType* producer_get_barrier(PipelineState state, uint32_t var) {
+  ProducerBarrierType* producer_get_barrier(LogicalPipelineState state, uint32_t var) {
     return producer_get_barrier(state.index(), var);
   }
 
@@ -362,43 +364,43 @@ public :
   // Consumer APIs
   ////////////////////
   CUTLASS_DEVICE
-  ConsumerToken consumer_try_wait(PipelineState state, uint32_t var, uint32_t skip_wait = false) {
+  ConsumerToken consumer_try_wait(LogicalPipelineState state, uint32_t var, uint32_t skip_wait = false) {
     return consumer_try_wait(state.index(), state.phase(), skip_wait, var);
   }
 
   CUTLASS_DEVICE
-  ConsumerToken consumer_test_wait(PipelineState state, uint32_t var, uint32_t skip_wait = false) {
+  ConsumerToken consumer_test_wait(LogicalPipelineState state, uint32_t var, uint32_t skip_wait = false) {
     return consumer_test_wait(state.index(), state.phase(), skip_wait, var);
   }
   
   CUTLASS_DEVICE
-  void consumer_wait(PipelineState state, uint32_t var) {
+  void consumer_wait(LogicalPipelineState state, uint32_t var) {
     consumer_wait(state.index(), state.phase(), var);
   }
 
   CUTLASS_DEVICE
-  void consumer_wait(PipelineState state, ConsumerToken barrier_token, uint32_t var) {
+  void consumer_wait(LogicalPipelineState state, ConsumerToken barrier_token, uint32_t var) {
     consumer_wait(state.index(), state.phase(), barrier_token, var);
   }
 
   CUTLASS_DEVICE
-  void consumer_release(PipelineState state, uint32_t var) {
+  void consumer_release(PhysicalPipelineState state, uint32_t var) {
     consumer_release(state.index(), var);
   }
 
   CUTLASS_DEVICE
-  void consumer_release_self(PipelineState state, uint32_t var) {
+  void consumer_release_self(PhysicalPipelineState state, uint32_t var) {
     consumer_release_self(state.index(), var);
   }
 
 private :
   uint32_t dst_blockid_ = 0;
   uint32_t is_signalling_thread_ = 0;
-  FullBarrier (*full_barrier_ptr_)[Stages] = nullptr;
+  FullBarrier (*full_barrier_ptr_)[PatternLen] = nullptr;
   EmptyBarrier (*empty_barrier_ptr_)[Stages] = nullptr;
-  SignalBarrier (*can_send_barrier_ptr_)[Stages] = nullptr;
-  SignalBarrier (*copy_finish_barrier_ptr_)[Stages] = nullptr;
-  SignalBarrier (*syncs_barrier_ptr_)[Stages] = nullptr;
+  SignalBarrier (*can_send_barrier_ptr_)[PatternLen] = nullptr;
+  SignalBarrier (*copy_finish_barrier_ptr_)[PatternLen] = nullptr;
+  SignalBarrier (*syncs_barrier_ptr_)[PatternLen] = nullptr;
   SignalBarrier (*mma_finish_barrier_ptr) = nullptr;
   Params params_;
 
@@ -411,29 +413,29 @@ private :
   //   return {static_cast<BarrierStatus>(barrier_status)};
   // }
 
-  CUTLASS_DEVICE
-  void producer_acquire(uint32_t stage, uint32_t phase, ProducerToken barrier_token, uint32_t var) {
-    if (barrier_token != BarrierStatus::WaitDone) {
-      empty_barrier_ptr_[var][stage].wait(phase);
-    }
-    if (barrier_token == BarrierStatus::WaitOnly) {
-      return;
-    }
+  // CUTLASS_DEVICE
+  // void producer_acquire(uint32_t stage, uint32_t phase, ProducerToken barrier_token, uint32_t var) {
+  //   if (barrier_token != BarrierStatus::WaitDone) {
+  //     empty_barrier_ptr_[var][stage].wait(phase);
+  //   }
+  //   if (barrier_token == BarrierStatus::WaitOnly) {
+  //     return;
+  //   }
 
-    if (params_.is_leader) {
-      full_barrier_ptr_[var][stage].arrive_and_expect_tx(params_.transaction_bytes[var]);
-    }
-    #ifndef NDEBUG
-    if (params_.role == ThreadCategory::Consumer || params_.role == ThreadCategory::NonParticipant) {
-      asm volatile ("brkpt;\n" ::);
-    }
+  //   if (params_.is_leader) {
+  //     full_barrier_ptr_[var][stage].arrive_and_expect_tx(params_.transaction_bytes[var]);
+  //   }
+  //   #ifndef NDEBUG
+  //   if (params_.role == ThreadCategory::Consumer || params_.role == ThreadCategory::NonParticipant) {
+  //     asm volatile ("brkpt;\n" ::);
+  //   }
 
-    // Most likely you have elected more than one leader
-    if (params_.is_leader && (threadIdx.x % 32 != 0)) {
-      asm volatile ("brkpt;\n" ::);
-    }
-    #endif
-  }
+  //   // Most likely you have elected more than one leader
+  //   if (params_.is_leader && (threadIdx.x % 32 != 0)) {
+  //     asm volatile ("brkpt;\n" ::);
+  //   }
+  //   #endif
+  // }
 
   // NOP for TMA based mainloop
   CUTLASS_DEVICE

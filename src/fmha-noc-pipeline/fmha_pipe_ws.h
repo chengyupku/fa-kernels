@@ -74,7 +74,7 @@ CUTLASS_DEVICE void static
 init_schedule(ScheduleStorage& shared_schedules) {
   if (threadIdx.x == 0) {
     for (int i = 0; i < IntraSplitNum; i++) {
-      for (int j = 0; j < stageCount; j++) {
+      for (int j = 0; j < PatternLen; j++) {
         shared_schedules.tileOrder[i][j] = tile_order[i][j];
         shared_schedules.srcKV[i][j] = srcKV[i][j];
         shared_schedules.dstKV[i][j] = dstKV[i][j];
@@ -106,11 +106,13 @@ fmhaForwardPipelinedWspl(
     SoftType *mi_ptr, SoftType *sPrimePtr, GmemLayoutMI gmemLayoutMi,
     float scale) {
   extern __shared__ char shared_memory[];
-  using MainloopPipeline = typename cutlass::PipelineTmaNoCAsync<stageCount>;
+  using MainloopPipeline = typename cutlass::PipelineTmaNoCAsync<stageCount, PatternLen>;
   // Change to this to use with CUTLASS 3.3 Pipeline API
   // using MainloopPipeline =
   //     typename cutlass::PipelineTmaAsync<stageCount, ClusterShape>;
   using PipelineState = typename cutlass::PipelineState<stageCount>;
+  using PhysicalPipelineState = typename cutlass::PipelineState<stageCount>;
+  using LogicalPipelineState = typename cutlass::PipelineState<PatternLen>;
   using BarrierType = typename MainloopPipeline::ProducerBarrierType;
 
   using SharedStorage =
@@ -280,16 +282,16 @@ fmhaForwardPipelinedWspl(
 
   uint32_t producer_phase = 0;
   uint32_t consumer_phase = 0;
-  // int receiver_ready_phase = 1;
   int sender_ready_phase = 0;
   int sender_dsmem_copy_finish_phase = 1;
   int receiver_dsmem_copy_finish_phase = 0;
   // int mma_wait_phase = 0;
-  PipelineState producer_physical_state   = cutlass::make_producer_start_state<MainloopPipeline>();
-  PipelineState producer_dsmem_send_state = cutlass::make_producer_start_state<MainloopPipeline>();
-  PipelineState producer_logical_state = PipelineState(0,1,0);
-  PipelineState consumer_logical_state = PipelineState(0,0,0);
-  cutlass::SeparatePipelineState receiver_ready_state_KV = cutlass::SeparatePipelineState<stageCount>(0,1,0);
+  PhysicalPipelineState producer_physical_state = cutlass::make_producer_start_state<MainloopPipeline>();
+  PhysicalPipelineState producer_noc_send_state = cutlass::make_producer_start_state<MainloopPipeline>();
+  PhysicalPipelineState consumer_physical_state = PhysicalPipelineState(0,0,0);
+  LogicalPipelineState  producer_logical_state  = LogicalPipelineState(0,1,0);
+  LogicalPipelineState  consumer_logical_state  = LogicalPipelineState(0,0,0);
+  cutlass::SeparatePipelineState receiver_ready_state_KV = cutlass::SeparatePipelineState<PatternLen>(0,1,0);
 
   // int blockIdxY = 0;
   int kIter = 0;
@@ -314,32 +316,33 @@ fmhaForwardPipelinedWspl(
 
       // For the DMA (prologue) - we start with an opposite phase - since we
       // skip all waits i.e., we know that the buffer is indeed empty
-      PipelineState smem_pipe_write =
-          make_producer_start_state<MainloopPipeline>();
+      // PipelineState smem_pipe_write =
+      //     make_producer_start_state<MainloopPipeline>();
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < tma_k_prologue; ++i) {
-        block_iter_id src_id_KV = shared_schedules.srcKV[bid.x][kIter % stageCount];
-        pipeline.wait_empty(smem_pipe_write, eK);
-        pipeline.wait_empty(smem_pipe_write, eV);
+        block_iter_id src_id_KV = shared_schedules.srcKV[bid.x][kIter % PatternLen];
+        pipeline.wait_empty(producer_physical_state, eK);
+        pipeline.wait_empty(producer_physical_state, eV);
         if (src_id_KV.x == -1) {
-          pipeline.copy_prepare(smem_pipe_write, eK);
-          pipeline.copy_prepare(smem_pipe_write, eV);
+          pipeline.copy_prepare(producer_logical_state, eK);
+          pipeline.copy_prepare(producer_logical_state, eV);
         }
-        BarrierType *tmaBarK = pipeline.producer_get_barrier(smem_pipe_write, eK);
-        BarrierType *tmaBarV = pipeline.producer_get_barrier(smem_pipe_write, eV);
-        int kTileIter = (kIter / stageCount) * stageCount + shared_schedules.tileOrder[bid.x][kIter % PatternLen];
+        BarrierType *tmaBarK = pipeline.producer_get_barrier(producer_logical_state, eK);
+        BarrierType *tmaBarV = pipeline.producer_get_barrier(producer_logical_state, eV);
+        int kTileIter = (kIter / PatternLen) * PatternLen + shared_schedules.tileOrder[bid.x][kIter % PatternLen];
         if (src_id_KV.x == -1) {
-          if (shared_schedules.dstKV[bid.x][((kIter - stageCount) % stageCount + stageCount) % stageCount].x != -1) {
-            pipeline.sender_wait_dsmem_copy_finish(sender_dsmem_copy_finish_phase, eK, kIter % stageCount);
-            pipeline.sender_wait_dsmem_copy_finish(sender_dsmem_copy_finish_phase, eV, kIter % stageCount);
+          if (shared_schedules.dstKV[bid.x][((kIter - stageCount) % PatternLen + PatternLen) % PatternLen].x != -1) {
+            pipeline.sender_wait_dsmem_copy_finish(sender_dsmem_copy_finish_phase, eK, kIter % PatternLen);
+            pipeline.sender_wait_dsmem_copy_finish(sender_dsmem_copy_finish_phase, eV, kIter % PatternLen);
           }
           fmhaForwardProducer(sK(_, _, i), tmaLoadK, tileShapeK, gmemLayoutK,
                               sV(_, _, i), tmaLoadV, tileShapeV, gmemLayoutV,
                               kTileIter, tmaBarK, tmaBarV, ClusterShape());
         }
-        ++smem_pipe_write;
+        ++producer_physical_state;
+        ++producer_logical_state;
         ++kIter;
-        if (((kIter - stageCount) % stageCount + stageCount) % stageCount == 0) {
+        if (((kIter - stageCount) % PatternLen + PatternLen) % PatternLen == 0) {
           sender_dsmem_copy_finish_phase ^= 1;
         }
       }
@@ -347,29 +350,30 @@ fmhaForwardPipelinedWspl(
 
       CUTE_NO_UNROLL
       for (; tma_k_iter > 0; --tma_k_iter) {
-        block_iter_id src_id_KV = shared_schedules.srcKV[bid.x][kIter % stageCount];
-        pipeline.wait_empty(smem_pipe_write, eK);
-        pipeline.wait_empty(smem_pipe_write, eV);
+        block_iter_id src_id_KV = shared_schedules.srcKV[bid.x][kIter % PatternLen];
+        pipeline.wait_empty(producer_physical_state, eK);
+        pipeline.wait_empty(producer_physical_state, eV);
         if (src_id_KV.x == -1) {
-          pipeline.copy_prepare(smem_pipe_write, eK);
-          pipeline.copy_prepare(smem_pipe_write, eV);
+          pipeline.copy_prepare(producer_logical_state, eK);
+          pipeline.copy_prepare(producer_logical_state, eV);
         }
-        BarrierType *tmaBarK = pipeline.producer_get_barrier(smem_pipe_write, eK);
-        BarrierType *tmaBarV = pipeline.producer_get_barrier(smem_pipe_write, eV);
-        auto stage = smem_pipe_write.index();
-        int kTileIter = (kIter / stageCount) * stageCount + shared_schedules.tileOrder[bid.x][kIter % PatternLen];
+        BarrierType *tmaBarK = pipeline.producer_get_barrier(producer_logical_state, eK);
+        BarrierType *tmaBarV = pipeline.producer_get_barrier(producer_logical_state, eV);
+        auto stage = producer_physical_state.index();
+        int kTileIter = (kIter / PatternLen) * PatternLen + shared_schedules.tileOrder[bid.x][kIter % PatternLen];
         if (src_id_KV.x == -1) {
-          if (shared_schedules.dstKV[bid.x][((kIter - stageCount) % stageCount + stageCount) % stageCount].x != -1) {
-            pipeline.sender_wait_dsmem_copy_finish(sender_dsmem_copy_finish_phase, eK, kIter % stageCount);
-            pipeline.sender_wait_dsmem_copy_finish(sender_dsmem_copy_finish_phase, eV, kIter % stageCount);
+          if (shared_schedules.dstKV[bid.x][((kIter - stageCount) % PatternLen + PatternLen) % PatternLen].x != -1) {
+            pipeline.sender_wait_dsmem_copy_finish(sender_dsmem_copy_finish_phase, eK, kIter % PatternLen);
+            pipeline.sender_wait_dsmem_copy_finish(sender_dsmem_copy_finish_phase, eV, kIter % PatternLen);
           }
           fmhaForwardProducer(sK(_, _, stage), tmaLoadK, tileShapeK, gmemLayoutK,
                               sV(_, _, stage), tmaLoadV, tileShapeV, gmemLayoutV,
                               kTileIter, tmaBarK, tmaBarV, ClusterShape());
         }
-        ++smem_pipe_write;
+        ++producer_physical_state;
+        ++producer_logical_state;
         ++kIter;
-        if (((kIter - stageCount) % stageCount + stageCount) % stageCount == 0) {
+        if (((kIter - stageCount) % PatternLen + PatternLen) % PatternLen == 0) {
           sender_dsmem_copy_finish_phase ^= 1;
         }
       }
@@ -377,7 +381,7 @@ fmhaForwardPipelinedWspl(
       // Tail Loop
       // Handles the case where we never enter the mainloop
       PipelineState tail =
-          tma_k_prologue == stageCount ? smem_pipe_write : PipelineState{};
+          tma_k_prologue == stageCount ? producer_physical_state : PipelineState{};
       for (int i = 0; i < tma_k_prologue; ++i) {
         pipeline.wait_empty(tail, eK);
         pipeline.wait_empty(tail, eV);
@@ -395,7 +399,7 @@ fmhaForwardPipelinedWspl(
 
       int sep_stage = 0;
       CUTLASS_PRAGMA_NO_UNROLL
-      for (int i = 0; i < stageCount; i++) {
+      for (int i = 0; i < PatternLen; i++) {
         sep_stage = i;
         if (shared_schedules.dstKV[bid.x][i].iter >= stageCount) { break; }
       }
@@ -404,42 +408,42 @@ fmhaForwardPipelinedWspl(
       int tma_k_iter = nTilesOfK;
       CUTE_NO_UNROLL
       for (; tma_k_iter > 0; --tma_k_iter) {
-        auto stage = producer_dsmem_send_state.index();
+        auto stage = producer_noc_send_state.index();
         Tensor tKsK = blockTmaK.partition_D(sK);
         Tensor tVsV = blockTmaV.partition_D(sV);
 
-        block_iter_id dst_id_KV = shared_schedules.dstKV[bid.x][kIter % stageCount];
-        int dst_stage = (dst_id_KV.iter - (kIter % stageCount) + producer_dsmem_send_state.index()) % stageCount;
+        block_iter_id dst_id_KV = shared_schedules.dstKV[bid.x][kIter % PatternLen];
+        int dst_stage = (dst_id_KV.iter - (kIter % PatternLen) + stage) % stageCount;
         if (dst_id_KV.x != -1) {
-          pipeline.sender_wait_sender_ready(sender_ready_phase, eK, kIter % stageCount);
-          pipeline.sender_wait_sender_ready(sender_ready_phase, eV, kIter % stageCount);
+          pipeline.sender_wait_sender_ready(sender_ready_phase, eK, kIter % PatternLen);
+          pipeline.sender_wait_sender_ready(sender_ready_phase, eV, kIter % PatternLen);
           pipeline.sender_wait_receiver_ready(receiver_ready_state_KV, eK);
           pipeline.sender_wait_receiver_ready(receiver_ready_state_KV, eV);
-          if (shared_schedules.dstKV[dst_id_KV.x][((dst_id_KV.iter - stageCount) + stageCount) % stageCount].x != -1) {
-            pipeline.sync_wait(sender_ready_phase, eK, kIter % stageCount);
-            pipeline.sync_wait(sender_ready_phase, eV, kIter % stageCount);
+          if (shared_schedules.dstKV[dst_id_KV.x][((dst_id_KV.iter - stageCount) + PatternLen) % PatternLen].x != -1) {
+            pipeline.sync_wait(sender_ready_phase, eK, kIter % PatternLen);
+            pipeline.sync_wait(sender_ready_phase, eV, kIter % PatternLen);
           }
           // copy to the block with the same bid.y
           uint32_t block_id = dst_id_KV.x + bid.y * cluster_shape.x;
-          pipeline.dsmem_copy_prepare(TmaTransactionBytesK, block_id, eK, dst_id_KV.iter % stageCount);
-          pipeline.dsmem_copy_prepare(TmaTransactionBytesV, block_id, eV, dst_id_KV.iter % stageCount);
-          BarrierType* tmaBarK = pipeline.producer_get_barrier_by_stage(dst_id_KV.iter % stageCount, eK);
-          BarrierType* tmaBarV = pipeline.producer_get_barrier_by_stage(dst_id_KV.iter % stageCount, eV);
+          pipeline.dsmem_copy_prepare(TmaTransactionBytesK, block_id, eK, dst_id_KV.iter % PatternLen);
+          pipeline.dsmem_copy_prepare(TmaTransactionBytesV, block_id, eV, dst_id_KV.iter % PatternLen);
+          BarrierType* tmaBarK = pipeline.producer_get_barrier_by_stage(dst_id_KV.iter % PatternLen, eK);
+          BarrierType* tmaBarV = pipeline.producer_get_barrier_by_stage(dst_id_KV.iter % PatternLen, eV);
           
-          src_int_addr = cast_smem_ptr_to_uint(tKsK(_,_,_,producer_dsmem_send_state.index()).data().get().get());
+          src_int_addr = cast_smem_ptr_to_uint(tKsK(_,_,_,stage).data().get().get());
           smem_int_mbar = set_block_rank(cast_smem_ptr_to_uint(tmaBarK), block_id);
           remote_addr = set_block_rank(cast_smem_ptr_to_uint(tKsK(_,_,_,dst_stage).data().get().get()), block_id);
           noc::dsmem_copy_func(src_int_addr, remote_addr, smem_int_mbar, TmaTransactionBytesK);
           
-          src_int_addr = cast_smem_ptr_to_uint(tVsV(_,_,_,producer_dsmem_send_state.index()).data().get().get());
+          src_int_addr = cast_smem_ptr_to_uint(tVsV(_,_,_,stage).data().get().get());
           smem_int_mbar = set_block_rank(cast_smem_ptr_to_uint(tmaBarV), block_id);
           remote_addr = set_block_rank(cast_smem_ptr_to_uint(tVsV(_,_,_,dst_stage).data().get().get()), block_id);
           noc::dsmem_copy_func(src_int_addr, remote_addr, smem_int_mbar, TmaTransactionBytesV);
         } 
         ++kIter;
         ++receiver_ready_state_KV;
-        ++producer_dsmem_send_state;
-        if (kIter % stageCount == 0) {
+        ++producer_noc_send_state;
+        if (kIter % PatternLen == 0) {
           sender_ready_phase ^= 1;
         }
       }
@@ -450,17 +454,17 @@ fmhaForwardPipelinedWspl(
       int tma_k_iter = nTilesOfK;
       CUTLASS_PRAGMA_NO_UNROLL
       for (; tma_k_iter > 0; --tma_k_iter) {
-        block_iter_id src_id_KV = shared_schedules.srcKV[bid.x][kIter % stageCount];
+        block_iter_id src_id_KV = shared_schedules.srcKV[bid.x][kIter % PatternLen];
         // Copy on this iteration is from dsmem
         if (src_id_KV.x != -1) {
           uint32_t block_id = src_id_KV.x + bid.y * cluster_shape.x;
-          pipeline.receiver_wait_dsmem_copy_finish(receiver_dsmem_copy_finish_phase, eK, kIter % stageCount);
-          pipeline.receiver_wait_dsmem_copy_finish(receiver_dsmem_copy_finish_phase, eV, kIter % stageCount);
-          pipeline.receiver_arrive_dsmem_copy_finish(block_id, eK, (src_id_KV.iter + stageCount) % stageCount);
-          pipeline.receiver_arrive_dsmem_copy_finish(block_id, eV, (src_id_KV.iter + stageCount) % stageCount);
+          pipeline.receiver_wait_dsmem_copy_finish(receiver_dsmem_copy_finish_phase, eK, kIter % PatternLen);
+          pipeline.receiver_wait_dsmem_copy_finish(receiver_dsmem_copy_finish_phase, eV, kIter % PatternLen);
+          pipeline.receiver_arrive_dsmem_copy_finish(block_id, eK, (src_id_KV.iter + stageCount) % PatternLen);
+          pipeline.receiver_arrive_dsmem_copy_finish(block_id, eV, (src_id_KV.iter + stageCount) % PatternLen);
         }
         ++kIter;
-        if (kIter % stageCount == 0) {
+        if (kIter % PatternLen == 0) {
           receiver_dsmem_copy_finish_phase ^= 1;
         }
       }
@@ -471,10 +475,10 @@ fmhaForwardPipelinedWspl(
       int tma_k_iter = nTilesOfK;
       CUTLASS_PRAGMA_NO_UNROLL
       for (; tma_k_iter > 0; --tma_k_iter) {
-        if (shared_schedules.dstKV[bid.x][((kIter - stageCount) % stageCount + stageCount) % stageCount].x != -1) {
-          pipeline.sender_wait_dsmem_copy_finish(sender_dsmem_copy_finish_phase, eK, kIter % stageCount);
-          pipeline.sender_wait_dsmem_copy_finish(sender_dsmem_copy_finish_phase, eV, kIter % stageCount);
-          block_iter_id src_id_KV = shared_schedules.srcKV[bid.x][kIter % stageCount];
+        if (shared_schedules.dstKV[bid.x][((kIter - stageCount) % PatternLen + PatternLen) % PatternLen].x != -1) {
+          pipeline.sender_wait_dsmem_copy_finish(sender_dsmem_copy_finish_phase, eK, kIter % PatternLen);
+          pipeline.sender_wait_dsmem_copy_finish(sender_dsmem_copy_finish_phase, eV, kIter % PatternLen);
+          block_iter_id src_id_KV = shared_schedules.srcKV[bid.x][kIter % PatternLen];
           if (src_id_KV.x != -1) {
             uint32_t block_id = src_id_KV.x + bid.y * cluster_shape.x;
             pipeline.sync_arrive(block_id, eK, src_id_KV.iter);
@@ -482,7 +486,7 @@ fmhaForwardPipelinedWspl(
           }
         }
         ++kIter;
-        if (((kIter - stageCount) % stageCount + stageCount) % stageCount == 0) {
+        if (((kIter - stageCount) % PatternLen + PatternLen) % PatternLen == 0) {
           sender_dsmem_copy_finish_phase ^= 1;
         }
       }
@@ -494,8 +498,9 @@ fmhaForwardPipelinedWspl(
     // calls setmaxnreg.inc.sync.aligned.u32
     cutlass::arch::warpgroup_reg_alloc<192>();
 
-    PipelineState smem_pipe_read;
-    PipelineState smem_pipe_release;
+    // PipelineState smem_pipe_read;
+    // PipelineState smem_pipe_release;
+    PhysicalPipelineState consumer_release_state = consumer_physical_state;
 
     // Init Shared Memory read stages & PhaseBit
     static constexpr uint32_t K_PIPE_MMAS = 1;
@@ -508,11 +513,11 @@ fmhaForwardPipelinedWspl(
 
     CUTLASS_PRAGMA_UNROLL
     for (int iter = 0; iter < mma_k_prologue; ++iter) {
-      pipeline.consumer_wait(smem_pipe_read, eK);
-      pipeline.consumer_wait(smem_pipe_read, eV);
+      pipeline.consumer_wait(consumer_logical_state, eK);
+      pipeline.consumer_wait(consumer_logical_state, eV);
       warpgroup_arrive();
 
-      int stage = smem_pipe_read.index();
+      int stage = consumer_physical_state.index();
       // NOTICE: This requires bM*bN*4 <= bN * headdim / SplitNum
       // Tensor sNocS =
       //     make_tensor(make_smem_ptr(reinterpret_cast<cutlass::half_t*>(shared_storage.kv.smem_k.data()) 
@@ -526,7 +531,8 @@ fmhaForwardPipelinedWspl(
                           tiledMma0, tiledMma1, tiledMmaCvt0,
                           send_mbar_ptr, recv_mbar_ptr, 
                           sNocS, sNocR, producer_phase, consumer_phase, AccumType(0), SoftType(0));
-      ++smem_pipe_read;
+      ++consumer_logical_state;
+      ++consumer_physical_state;
     }
     gemm_k_iterations -= mma_k_prologue;
 
@@ -534,11 +540,11 @@ fmhaForwardPipelinedWspl(
     CUTLASS_PRAGMA_NO_UNROLL
     for (; gemm_k_iterations > 0; --gemm_k_iterations) {
       /// Wait on the smem_pipe_read stage / phase
-      pipeline.consumer_wait(smem_pipe_read, eK);
-      pipeline.consumer_wait(smem_pipe_read, eV);
+      pipeline.consumer_wait(consumer_logical_state, eK);
+      pipeline.consumer_wait(consumer_logical_state, eV);
       warpgroup_arrive();
 
-      int stage = smem_pipe_read.index();
+      int stage = consumer_physical_state.index();
       // NOTICE: This requires bM*bN*4 <= bN * headdim / SplitNum
       // Tensor sNocS =
       //     make_tensor(make_smem_ptr(reinterpret_cast<cutlass::half_t*>(shared_storage.kv.smem_k.data()) 
@@ -558,7 +564,7 @@ fmhaForwardPipelinedWspl(
       //    warpgroup_fence_operand(tOrO);
 
       if (threadIdx.x % 128 == 0) {
-        block_iter_id src_id_KV = shared_schedules.srcKV[bid.x][(kReleaseIter + stageCount) % stageCount];
+        block_iter_id src_id_KV = shared_schedules.srcKV[bid.x][(kReleaseIter + stageCount) % PatternLen];
         if (src_id_KV.x != -1) {
           uint32_t block_id = src_id_KV.x + bid.y * cluster_shape.x;
           pipeline.receiver_arrive_sender(block_id, eK, src_id_KV.iter);
@@ -566,21 +572,22 @@ fmhaForwardPipelinedWspl(
         }
       }
 
-      pipeline.consumer_release_self(smem_pipe_release, eK);
-      pipeline.consumer_release_self(smem_pipe_release, eV);
+      pipeline.consumer_release_self(consumer_release_state, eK);
+      pipeline.consumer_release_self(consumer_release_state, eV);
 
       // Advance stages
-      ++smem_pipe_read;
-      ++smem_pipe_release;
+      ++consumer_logical_state;
+      ++consumer_physical_state;
+      ++consumer_release_state;
       ++kReleaseIter;
     }
 
     warpgroup_wait<0>();
     // Tail Loop
     for (int i = 0; i < K_PIPE_MMAS; ++i) {
-      pipeline.consumer_release_self(smem_pipe_release, eK);
-      pipeline.consumer_release_self(smem_pipe_release, eV);
-      ++smem_pipe_release;
+      pipeline.consumer_release_self(consumer_release_state, eK);
+      pipeline.consumer_release_self(consumer_release_state, eV);
+      ++consumer_release_state;
     }
 
     // TMA Store epilogue

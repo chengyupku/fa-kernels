@@ -85,12 +85,12 @@ struct SharedStorage {
     cute::uint64_t tma_load_mbar[8]; // 8 TMA barriers pre-allocated for usage.
     cute::uint64_t noc_send[1];
     cute::uint64_t noc_recv[1];
-    typename cutlass::PipelineTmaNoCAsync<stageCount>::SharedStorage storage;
+    typename cutlass::PipelineTmaNoCAsync<stageCount, PatternLen>::SharedStorage storage;
   };
   struct ScheduleStorage : cute::aligned_struct<128> {
-    int8_t tileOrder[2][PatternLen];
-    block_iter_id srcKV[2][PatternLen];
-    block_iter_id dstKV[2][PatternLen];
+    int8_t tileOrder[IntraSplitNum][PatternLen];
+    block_iter_id srcKV[IntraSplitNum][PatternLen];
+    block_iter_id dstKV[IntraSplitNum][PatternLen];
   } schedules;
 };
 #endif
