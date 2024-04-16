@@ -33,6 +33,7 @@ constexpr int NumMmaThreads = 128;
 
 // #include "cutlass/pipeline/pipeline.hpp"
 #include "async_pipeline.hpp"
+#include "utils.h"
 
 // Shared Storage with Aligned addresses.
 template <class Gemm1Type, class Gemm2Type, class SmemLayoutK,
@@ -65,7 +66,7 @@ struct SharedStorage {
 };
 #else
 template <class Gemm1Type, class Gemm2Type, class OutputType, class SmemLayoutQ,
-          class SmemLayoutK, class SmemLayoutS, class SmemLayoutV,
+          class SmemLayoutK, class SmemLayoutS, class SmemLayoutPS, class SmemLayoutV,
           class SmemLayoutO,
           typename ClusterShape = cutlass::gemm::GemmShape<1, 1, 1>>
 struct SharedStorage {
@@ -77,8 +78,8 @@ struct SharedStorage {
           kv;
       cute::array_aligned<OutputType, cute::cosize_v<SmemLayoutO>> smem_o;
     };
-    // cute::array_aligned<cutlass::half_t, cute::cosize_v<SmemLayoutS>> smem_s;
-    // cute::array_aligned<cutlass::half_t, cute::cosize_v<SmemLayoutS>> smem_r;
+    cute::array_aligned<cutlass::half_t, cute::cosize_v<SmemLayoutPS>> smem_s;
+    cute::array_aligned<cutlass::half_t, cute::cosize_v<SmemLayoutPS>> smem_r;
   };
   struct {
     cute::uint64_t tma_load_mbar[8]; // 8 TMA barriers pre-allocated for usage.
@@ -86,5 +87,10 @@ struct SharedStorage {
     cute::uint64_t noc_recv[1];
     typename cutlass::PipelineTmaNoCAsync<stageCount>::SharedStorage storage;
   };
+  struct ScheduleStorage : cute::aligned_struct<128> {
+    int8_t tileOrder[2][PatternLen];
+    block_iter_id srcKV[2][PatternLen];
+    block_iter_id dstKV[2][PatternLen];
+  } schedules;
 };
 #endif

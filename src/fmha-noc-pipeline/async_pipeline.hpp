@@ -7,11 +7,107 @@ namespace cutlass {
 
 using namespace cute;
 
+template<uint32_t Stages_>
+struct SeparatePipelineState {
+
+  static constexpr uint32_t Stages = Stages_;
+
+private:
+  int index_ = 0;
+  uint32_t phase_ = 0;
+  uint32_t phase_count_ = 0;
+  // When get to sep_stage_, flip the phase
+  uint32_t sep_stage_ = 0;
+
+public:
+  CUTLASS_DEVICE
+  SeparatePipelineState(): index_{}, phase_{}, phase_count_{}, sep_stage_{} {}
+
+  CUTLASS_DEVICE
+  SeparatePipelineState(int index, uint32_t phase, uint32_t phase_count, uint32_t sep_stage=0)
+    : index_(index)
+    , phase_(phase)
+    , phase_count_(phase_count)
+    , sep_stage_(sep_stage) {}
+
+  CUTLASS_DEVICE
+  void set_sep_stage(uint32_t sep_stage) {
+    sep_stage_ = sep_stage;
+  }
+
+  CUTLASS_DEVICE
+  int index() const {
+    return index_;
+  }
+
+  CUTLASS_DEVICE
+  uint32_t phase() const {
+    return phase_;
+  }
+
+  CUTLASS_DEVICE
+  uint32_t phase_count() const {
+    return phase_count_;
+  }
+
+  CUTLASS_DEVICE
+  uint32_t sep_stage() const {
+    return sep_stage_;
+  }
+
+  CUTLASS_DEVICE
+  void operator++() {
+    if constexpr (Stages > 0) {
+      ++index_;
+      if (index_ == Stages) {
+        index_ = 0;
+      }
+      if (index_ == sep_stage_) {
+        phase_ ^= 1;
+        ++phase_count_;
+      }
+    }
+  }
+
+  CUTLASS_DEVICE
+  SeparatePipelineState& operator=(const SeparatePipelineState& other) {
+    index_ = other.index();
+    phase_ = other.phase();
+    phase_count_ = other.phase_count();
+    sep_stage_ = other.sep_stage();
+    return *this;
+  }
+
+  CUTLASS_DEVICE
+  SeparatePipelineState advance(uint32_t num_iterations) {
+    if constexpr (Stages > 0) {
+      // Number of iterations cross over the stage boundary => flipped phase
+      if ((num_iterations < Stages) && (index_ + num_iterations) % Stages >= sep_stage_) {
+        phase_ ^= 1;
+      }
+      // How many times number of iterations cross over the stage boundary and
+      // end up on a odd number => flipped phase
+      if ((num_iterations >= Stages) && (((index_ + num_iterations - sep_stage_) / Stages) % 2) == 1) {
+        phase_ ^= 1;
+      }
+      phase_count_ += (index_ + num_iterations - sep_stage_) / Stages;
+      index_ = (index_ + num_iterations) % Stages;
+    }
+    return *this;
+  }
+
+  CUTLASS_DEVICE
+  static SeparatePipelineState make_pipeline_state(SeparatePipelineState start_state, uint32_t num_iterations) {
+    return start_state.advance(num_iterations);
+  }
+};
+
 template <int Stages_>
 class PipelineTmaNoCAsync {
 public :
   using FullBarrier = cutlass::arch::ClusterTransactionBarrier;
   using EmptyBarrier = cutlass::arch::ClusterBarrier;
+  using SignalBarrier = cutlass::arch::ClusterBarrier;
   using ProducerBarrierType = FullBarrier::ValueType;
   using ConsumerBarrierType = EmptyBarrier::ValueType;
   static constexpr uint32_t Stages = Stages_;
@@ -20,6 +116,10 @@ public :
   struct SharedStorage {
     FullBarrier full_barrier_[2][Stages];
     EmptyBarrier empty_barrier_[2][Stages];
+    SignalBarrier can_send_barrier_[2][Stages];
+    SignalBarrier copy_finish_barrier_[2][Stages];
+    SignalBarrier syncs_barrier_[2][Stages];
+    SignalBarrier mma_finish_barrier_[1];
   };
 
   enum class ThreadCategory {
@@ -42,7 +142,11 @@ public :
   PipelineTmaNoCAsync(SharedStorage& storage, Params params, ClusterShape cluster_shape)
       : params_(params)
       , full_barrier_ptr_(storage.full_barrier_)
-      , empty_barrier_ptr_(storage.empty_barrier_) {
+      , empty_barrier_ptr_(storage.empty_barrier_) 
+      , can_send_barrier_ptr_(storage.can_send_barrier_)
+      , copy_finish_barrier_ptr_(storage.copy_finish_barrier_)
+      , syncs_barrier_ptr_(storage.syncs_barrier_)
+      , mma_finish_barrier_ptr(storage.mma_finish_barrier_) {
 
     int warp_idx = canonical_warp_idx();
     int lane_predicate = cute::elect_one_sync();
@@ -60,6 +164,18 @@ public :
       for (int i = 0; i < Stages; ++i) {
         empty_barrier_ptr_[eK][i].init(multicast_consumer_arrival_count);
         empty_barrier_ptr_[eV][i].init(multicast_consumer_arrival_count);
+      }
+      for (int i = 0; i < Stages; ++i) {
+        can_send_barrier_ptr_[eK][i].init(num_consumer_warpgroups_per_cluster);
+        can_send_barrier_ptr_[eV][i].init(num_consumer_warpgroups_per_cluster);
+      }
+      for (int i = 0; i < Stages; ++i) {
+        copy_finish_barrier_ptr_[eK][i].init(1);
+        copy_finish_barrier_ptr_[eV][i].init(1);
+      }
+      for (int i = 0; i < Stages; ++i) {
+        syncs_barrier_ptr_[eK][i].init(1);
+        syncs_barrier_ptr_[eV][i].init(1);
       }
     }
     cutlass::arch::fence_barrier_init();
@@ -141,6 +257,87 @@ public :
   }
 
   CUTLASS_DEVICE
+  void wait_empty(PipelineState state, uint32_t var) {
+    empty_barrier_ptr_[var][state.index()].wait(state.phase());
+  }
+
+  CUTLASS_DEVICE
+  void copy_prepare(PipelineState state, uint32_t var, uint32_t transaction_bytes = 0, bool no_trans = false) {
+    if (params_.is_leader) {
+      if (transaction_bytes == 0) {
+        transaction_bytes = params_.transaction_bytes[var];
+      }
+      if (no_trans) {
+        transaction_bytes = 0;
+      }
+      full_barrier_ptr_[var][state.index()].arrive_and_expect_tx(transaction_bytes);
+    }
+  }
+
+  CUTLASS_DEVICE
+  void receiver_arrive_sender(uint32_t dst_block_id, uint32_t var, uint32_t stage) {
+    can_send_barrier_ptr_[var][stage].arrive(dst_block_id);
+  }
+  
+  CUTLASS_DEVICE
+  void sender_wait_receiver_ready(SeparatePipelineState<Stages> state, uint32_t var) {
+    can_send_barrier_ptr_[var][state.index()].wait(state.phase());
+  }
+
+  CUTLASS_DEVICE
+  void sender_wait_dsmem_copy_finish(uint32_t phase, uint32_t var, uint32_t stage) {
+    copy_finish_barrier_ptr_[var][stage].wait(phase);
+  }
+
+  CUTLASS_DEVICE
+  void sender_wait_sender_ready(uint32_t phase, uint32_t var, uint32_t stage) {
+    uint32_t done;
+    done = full_barrier_ptr_[var][stage].test_wait(phase);
+    if (not done) {
+      full_barrier_ptr_[var][stage].wait(phase);
+    }
+  }
+  
+  CUTLASS_DEVICE
+  void dsmem_copy_prepare(uint32_t transaction_bytes, uint32_t cta_id, uint32_t var, uint32_t stage) {
+    full_barrier_ptr_[var][stage].arrive_and_expect_tx(transaction_bytes, cta_id);
+  }
+  
+  CUTLASS_DEVICE
+  void receiver_wait_dsmem_copy_finish(uint32_t phase, uint32_t var, uint32_t stage) {
+    // phase may have bug
+    uint32_t done;
+    done = full_barrier_ptr_[var][stage].test_wait(phase);
+    if (not done) {
+      full_barrier_ptr_[var][stage].wait(phase);
+    }
+  }
+
+  CUTLASS_DEVICE
+  void receiver_arrive_dsmem_copy_finish(uint32_t dst_block_id, uint32_t var, uint32_t stage) {
+    copy_finish_barrier_ptr_[var][stage].arrive(dst_block_id);
+  }
+
+  CUTLASS_DEVICE
+  void sync_wait(uint32_t phase, uint32_t var, uint32_t stage) {
+    uint32_t done;
+    done = syncs_barrier_ptr_[var][stage].test_wait(phase);
+    if (not done) {
+      syncs_barrier_ptr_[var][stage].wait(phase);
+    }
+  }
+
+  CUTLASS_DEVICE
+  void sync_arrive(uint32_t dst_block_id, uint32_t var, uint32_t stage) {
+    syncs_barrier_ptr_[var][stage].arrive(dst_block_id);
+  }
+
+  CUTLASS_DEVICE
+  ProducerBarrierType* producer_get_barrier_by_stage(uint32_t stage, uint32_t var) {
+    return producer_get_barrier(stage, var);
+  }
+
+  CUTLASS_DEVICE
   void producer_commit(PipelineState state, uint32_t bytes) {
     producer_commit(state.index(), bytes);
   }
@@ -199,6 +396,10 @@ private :
   uint32_t is_signalling_thread_ = 0;
   FullBarrier (*full_barrier_ptr_)[Stages] = nullptr;
   EmptyBarrier (*empty_barrier_ptr_)[Stages] = nullptr;
+  SignalBarrier (*can_send_barrier_ptr_)[Stages] = nullptr;
+  SignalBarrier (*copy_finish_barrier_ptr_)[Stages] = nullptr;
+  SignalBarrier (*syncs_barrier_ptr_)[Stages] = nullptr;
+  SignalBarrier (*mma_finish_barrier_ptr) = nullptr;
   Params params_;
 
   // CUTLASS_DEVICE

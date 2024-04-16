@@ -45,10 +45,10 @@ fmhaForwardConsumer(Gemm1Type const *Q, Gemm1Type const *K, Gemm2Type const *V, 
   for (int iter = 0; iter < NoCIter/*log(KDimSplitNum)+1*/; iter++) {
     uint32_t src_group_size = iter == NoCIter - 1 ? 1 : 1 << (iter + 1);
     uint32_t dst_group_size = 1 << iter;
-    uint32_t src_id = (clusterBlockRank + src_group_size) % (src_group_size << 1) 
-                    + (clusterBlockRank / (src_group_size << 1)) * (src_group_size << 1);
-    uint32_t dst_id = (clusterBlockRank + dst_group_size) % (dst_group_size << 1) 
-                    + (clusterBlockRank / (dst_group_size << 1)) * (dst_group_size << 1);
+    uint32_t src_id = (((clusterBlockRank / cluster_shape.x) + src_group_size) % (src_group_size << 1) 
+                    + ((clusterBlockRank / cluster_shape.x) / (src_group_size << 1)) * (src_group_size << 1)) * cluster_shape.x + clusterBlockRank % cluster_shape.x;
+    uint32_t dst_id = (((clusterBlockRank / cluster_shape.x) + dst_group_size) % (dst_group_size << 1) 
+                    + ((clusterBlockRank / cluster_shape.x) / (dst_group_size << 1)) * (dst_group_size << 1)) * cluster_shape.x + clusterBlockRank % cluster_shape.x;
 
     if (threadIdx.x == 128) {
       noc::arrive_empty(recv_mbar_ptr, src_id);

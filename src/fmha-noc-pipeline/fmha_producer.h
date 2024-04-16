@@ -55,7 +55,7 @@ fmhaForwardProducer(Tensor<TensorEngineK, SmemLayoutK> &&sK,
   // Get the GMEM tensors for K and V
   //
   auto blkCoordK = make_coord(blockIdxY, 0, blockIdxH, blockIdxB);
-  Tensor gK = local_tile(mK(_,_,clusterBlockRank,_,_), tileShapeK, blkCoordK);
+  Tensor gK = local_tile(mK(_,_,clusterBlockRank / cluster_shape.x,_,_), tileShapeK, blkCoordK);
 
   Tensor tKgKX = blockTmaK.partition_S(gK);
   Tensor tKgK = group_modes<1, rank(tKgKX)>(tKgKX); // (TMA,REST)
@@ -69,7 +69,7 @@ fmhaForwardProducer(Tensor<TensorEngineK, SmemLayoutK> &&sK,
   auto blkCoordV = make_coord(blockIdxY, 0, blockIdxH, blockIdxB);
 #endif
 
-  Tensor gV = local_tile(mV(_,_,clusterBlockRank,_,_), tileShapeV, blkCoordV);
+  Tensor gV = local_tile(mV(_,_,clusterBlockRank / cluster_shape.x,_,_), tileShapeV, blkCoordV);
 
   Tensor tVgVX = blockTmaV.partition_S(gV);
   Tensor tVgV = group_modes<1, rank(tVgVX)>(tVgVX); // (TMA,REST)

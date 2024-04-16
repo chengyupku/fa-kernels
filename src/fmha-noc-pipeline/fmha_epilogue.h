@@ -161,7 +161,7 @@ fmhaForwardWriteOutTMA(TensorO &tOrO, const RowMax &rowMax,
 
   Tensor mO = tmaStoreO.get_tma_tensor(shape(gmemLayoutO));
   auto blkCoordO = make_coord(blockIdxX, 0, blockIdxH, blockIdxB);
-  Tensor gO = local_tile(mO(_,_,clusterBlockRank,_,_), tileShapeO, blkCoordO);
+  Tensor gO = local_tile(mO(_,_,clusterBlockRank / cluster_shape.x,_,_), tileShapeO, blkCoordO);
 
   auto cta_tmaO = tmaStoreO.get_slice(0);
 

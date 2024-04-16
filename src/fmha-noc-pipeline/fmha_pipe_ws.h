@@ -64,9 +64,24 @@
 #include "fmha_producer.h"
 #include "shared_storage.h"
 #include "noc_config.h"
+#include "utils.h"
 
 using namespace cute;
 using namespace cutlass;
+
+template<class ScheduleStorage>
+CUTLASS_DEVICE void static
+init_schedule(ScheduleStorage& shared_schedules) {
+  if (threadIdx.x == 0) {
+    for (int i = 0; i < IntraSplitNum; i++) {
+      for (int j = 0; j < stageCount; j++) {
+        shared_schedules.tileOrder[i][j] = tile_order[i][j];
+        shared_schedules.srcKV[i][j] = srcKV[i][j];
+        shared_schedules.dstKV[i][j] = dstKV[i][j];
+      }
+    }
+  }
+}
 
 template <class Gemm1Type, class AccumType, class SoftType, class Gemm2Type,
           class OutputType, class TiledMma0, class TiledMma1, class TiledMmaCvt0,
@@ -100,7 +115,7 @@ fmhaForwardPipelinedWspl(
 
   using SharedStorage =
       SharedStorage<Gemm1Type, Gemm2Type, OutputType, SmemLayoutQ, SmemLayoutK,
-                    SmemLayoutS, SmemLayoutV, SmemLayoutO, ClusterShape>;
+                    SmemLayoutS, SmemLayoutPS, SmemLayoutV, SmemLayoutO, ClusterShape>;
   SharedStorage &shared_storage =
       *reinterpret_cast<SharedStorage *>(shared_memory);
 
@@ -108,12 +123,13 @@ fmhaForwardPipelinedWspl(
   int warp_idx_in_warpgroup =
       __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
   int warp_group_thread_idx = threadIdx.x % 128;
-  dim3 block_id_in_cluster = cute::block_id_in_cluster();
+  dim3 bid = cute::block_id_in_cluster();
 
-  auto cluster_shape = ClusterShape{};
+  auto cluster_shape_ = ClusterShape{};
 
   namespace cg = cooperative_groups;
   cg::cluster_group cluster = cg::this_cluster();
+  dim3 cluster_shape = cluster.dim_blocks();
   uint32_t clusterBlockRank = cluster.block_rank();
 
   // Unlike the unit test we always set this variable to 1
@@ -146,12 +162,12 @@ fmhaForwardPipelinedWspl(
   // Just a dummy sS (with smem_v). It's required only for shape later.
   Tensor sS =
       make_tensor(make_smem_ptr(shared_storage.kv.smem_k.data()), smemLayoutS);
-  // Tensor sNocS =
-  //     make_tensor(make_smem_ptr(reinterpret_cast<cutlass::half_t*>(shared_storage.smem_s.data())), smemLayoutPS);
-  //     // make_tensor(make_smem_ptr(reinterpret_cast<cutlass::half_t*>(shared_storage.kv.smem_k.data()) + 0       ), smemLayoutPS);
-  // Tensor sNocR =
-  //     make_tensor(make_smem_ptr(reinterpret_cast<cutlass::half_t*>(shared_storage.smem_r.data())), smemLayoutPS);
-  //     // make_tensor(make_smem_ptr(reinterpret_cast<cutlass::half_t*>(shared_storage.kv.smem_k.data()) + size(sNocS)), smemLayoutPS);
+  Tensor sNocS =
+      make_tensor(make_smem_ptr(reinterpret_cast<cutlass::half_t*>(shared_storage.smem_s.data())), smemLayoutPS);
+      // make_tensor(make_smem_ptr(reinterpret_cast<cutlass::half_t*>(shared_storage.kv.smem_k.data()) + 0       ), smemLayoutPS);
+  Tensor sNocR =
+      make_tensor(make_smem_ptr(reinterpret_cast<cutlass::half_t*>(shared_storage.smem_r.data())), smemLayoutPS);
+      // make_tensor(make_smem_ptr(reinterpret_cast<cutlass::half_t*>(shared_storage.kv.smem_k.data()) + size(sNocS)), smemLayoutPS);
 #endif
   Tensor sV =
       make_tensor(make_smem_ptr(shared_storage.kv.smem_v.data()), smemLayoutV);
@@ -169,7 +185,7 @@ fmhaForwardPipelinedWspl(
 
   // Get the block of Q for this CTA using the block coordinates
   auto blkCoordQ = make_coord(blockIdxX, 0, blockIdxH, blockIdxB);
-  Tensor gQ = local_tile(mQ(_,_,clusterBlockRank,_,_), tileShapeQ, blkCoordQ);
+  Tensor gQ = local_tile(mQ(_,_,clusterBlockRank / cluster_shape.x,_,_), tileShapeQ, blkCoordQ);
 
   // Partition the copying of source tiles for Q among threads.
   auto cta_tmaQ = tmaLoadQ.get_slice(0);
@@ -245,7 +261,7 @@ fmhaForwardPipelinedWspl(
   params.is_leader = warp_group_thread_idx == 0;
   params.num_consumers = NumMmaThreads;
 
-  MainloopPipeline pipeline(shared_storage.storage, params, cluster_shape);
+  MainloopPipeline pipeline(shared_storage.storage, params, cluster_shape_);
   // Change to this to use with CUTLASS 3.3 Pipeline API
   // MainloopPipeline pipeline(shared_storage.storage, params);
 
@@ -259,10 +275,24 @@ fmhaForwardPipelinedWspl(
     recv_mbar_ptr[0].init(1);
   }
 
+  auto& shared_schedules = shared_storage.schedules;
+  init_schedule(shared_schedules);
+
   uint32_t producer_phase = 0;
   uint32_t consumer_phase = 0;
+  // int receiver_ready_phase = 1;
+  int sender_ready_phase = 0;
+  int sender_dsmem_copy_finish_phase = 1;
+  int receiver_dsmem_copy_finish_phase = 0;
+  // int mma_wait_phase = 0;
+  PipelineState producer_physical_state   = cutlass::make_producer_start_state<MainloopPipeline>();
+  PipelineState producer_dsmem_send_state = cutlass::make_producer_start_state<MainloopPipeline>();
+  PipelineState producer_logical_state = PipelineState(0,1,0);
+  PipelineState consumer_logical_state = PipelineState(0,0,0);
+  cutlass::SeparatePipelineState receiver_ready_state_KV = cutlass::SeparatePipelineState<stageCount>(0,1,0);
 
-  int blockIdxY = 0;
+  // int blockIdxY = 0;
+  int kIter = 0;
 
   __syncthreads();
 
@@ -288,28 +318,60 @@ fmhaForwardPipelinedWspl(
           make_producer_start_state<MainloopPipeline>();
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < tma_k_prologue; ++i) {
-        pipeline.producer_acquire(smem_pipe_write, eK);
-        pipeline.producer_acquire(smem_pipe_write, eV);
+        block_iter_id src_id_KV = shared_schedules.srcKV[bid.x][kIter % stageCount];
+        pipeline.wait_empty(smem_pipe_write, eK);
+        pipeline.wait_empty(smem_pipe_write, eV);
+        if (src_id_KV.x == -1) {
+          pipeline.copy_prepare(smem_pipe_write, eK);
+          pipeline.copy_prepare(smem_pipe_write, eV);
+        }
         BarrierType *tmaBarK = pipeline.producer_get_barrier(smem_pipe_write, eK);
         BarrierType *tmaBarV = pipeline.producer_get_barrier(smem_pipe_write, eV);
-        fmhaForwardProducer(sK(_, _, i), tmaLoadK, tileShapeK, gmemLayoutK,
-                            sV(_, _, i), tmaLoadV, tileShapeV, gmemLayoutV,
-                            blockIdxY++, tmaBarK, tmaBarV, ClusterShape());
+        int kTileIter = (kIter / stageCount) * stageCount + shared_schedules.tileOrder[bid.x][kIter % PatternLen];
+        if (src_id_KV.x == -1) {
+          if (shared_schedules.dstKV[bid.x][((kIter - stageCount) % stageCount + stageCount) % stageCount].x != -1) {
+            pipeline.sender_wait_dsmem_copy_finish(sender_dsmem_copy_finish_phase, eK, kIter % stageCount);
+            pipeline.sender_wait_dsmem_copy_finish(sender_dsmem_copy_finish_phase, eV, kIter % stageCount);
+          }
+          fmhaForwardProducer(sK(_, _, i), tmaLoadK, tileShapeK, gmemLayoutK,
+                              sV(_, _, i), tmaLoadV, tileShapeV, gmemLayoutV,
+                              kTileIter, tmaBarK, tmaBarV, ClusterShape());
+        }
         ++smem_pipe_write;
+        ++kIter;
+        if (((kIter - stageCount) % stageCount + stageCount) % stageCount == 0) {
+          sender_dsmem_copy_finish_phase ^= 1;
+        }
       }
       int tma_k_iter = nTilesOfK - tma_k_prologue;
 
       CUTE_NO_UNROLL
       for (; tma_k_iter > 0; --tma_k_iter) {
-        pipeline.producer_acquire(smem_pipe_write, eK);
-        pipeline.producer_acquire(smem_pipe_write, eV);
+        block_iter_id src_id_KV = shared_schedules.srcKV[bid.x][kIter % stageCount];
+        pipeline.wait_empty(smem_pipe_write, eK);
+        pipeline.wait_empty(smem_pipe_write, eV);
+        if (src_id_KV.x == -1) {
+          pipeline.copy_prepare(smem_pipe_write, eK);
+          pipeline.copy_prepare(smem_pipe_write, eV);
+        }
         BarrierType *tmaBarK = pipeline.producer_get_barrier(smem_pipe_write, eK);
         BarrierType *tmaBarV = pipeline.producer_get_barrier(smem_pipe_write, eV);
         auto stage = smem_pipe_write.index();
-        fmhaForwardProducer(sK(_, _, stage), tmaLoadK, tileShapeK, gmemLayoutK,
-                            sV(_, _, stage), tmaLoadV, tileShapeV, gmemLayoutV,
-                            blockIdxY++, tmaBarK, tmaBarV, ClusterShape());
+        int kTileIter = (kIter / stageCount) * stageCount + shared_schedules.tileOrder[bid.x][kIter % PatternLen];
+        if (src_id_KV.x == -1) {
+          if (shared_schedules.dstKV[bid.x][((kIter - stageCount) % stageCount + stageCount) % stageCount].x != -1) {
+            pipeline.sender_wait_dsmem_copy_finish(sender_dsmem_copy_finish_phase, eK, kIter % stageCount);
+            pipeline.sender_wait_dsmem_copy_finish(sender_dsmem_copy_finish_phase, eV, kIter % stageCount);
+          }
+          fmhaForwardProducer(sK(_, _, stage), tmaLoadK, tileShapeK, gmemLayoutK,
+                              sV(_, _, stage), tmaLoadV, tileShapeV, gmemLayoutV,
+                              kTileIter, tmaBarK, tmaBarV, ClusterShape());
+        }
         ++smem_pipe_write;
+        ++kIter;
+        if (((kIter - stageCount) % stageCount + stageCount) % stageCount == 0) {
+          sender_dsmem_copy_finish_phase ^= 1;
+        }
       }
 
       // Tail Loop
@@ -317,9 +379,112 @@ fmhaForwardPipelinedWspl(
       PipelineState tail =
           tma_k_prologue == stageCount ? smem_pipe_write : PipelineState{};
       for (int i = 0; i < tma_k_prologue; ++i) {
-        pipeline.producer_acquire(tail, eK);
-        pipeline.producer_acquire(tail, eV);
+        pipeline.wait_empty(tail, eK);
+        pipeline.wait_empty(tail, eV);
         ++tail;
+      }
+    }
+    // Issue NoC copy
+    else if (threadIdx.x == 32) {
+      uint32_t src_int_addr;
+      uint32_t smem_int_mbar;
+      uint32_t remote_addr;
+      
+      auto blockTmaK = tmaLoadK.get_slice(0);
+      auto blockTmaV = tmaLoadV.get_slice(0);
+
+      int sep_stage = 0;
+      CUTLASS_PRAGMA_NO_UNROLL
+      for (int i = 0; i < stageCount; i++) {
+        sep_stage = i;
+        if (shared_schedules.dstKV[bid.x][i].iter >= stageCount) { break; }
+      }
+      receiver_ready_state_KV.set_sep_stage(sep_stage);
+
+      int tma_k_iter = nTilesOfK;
+      CUTE_NO_UNROLL
+      for (; tma_k_iter > 0; --tma_k_iter) {
+        auto stage = producer_dsmem_send_state.index();
+        Tensor tKsK = blockTmaK.partition_D(sK);
+        Tensor tVsV = blockTmaV.partition_D(sV);
+
+        block_iter_id dst_id_KV = shared_schedules.dstKV[bid.x][kIter % stageCount];
+        int dst_stage = (dst_id_KV.iter - (kIter % stageCount) + producer_dsmem_send_state.index()) % stageCount;
+        if (dst_id_KV.x != -1) {
+          pipeline.sender_wait_sender_ready(sender_ready_phase, eK, kIter % stageCount);
+          pipeline.sender_wait_sender_ready(sender_ready_phase, eV, kIter % stageCount);
+          pipeline.sender_wait_receiver_ready(receiver_ready_state_KV, eK);
+          pipeline.sender_wait_receiver_ready(receiver_ready_state_KV, eV);
+          if (shared_schedules.dstKV[dst_id_KV.x][((dst_id_KV.iter - stageCount) + stageCount) % stageCount].x != -1) {
+            pipeline.sync_wait(sender_ready_phase, eK, kIter % stageCount);
+            pipeline.sync_wait(sender_ready_phase, eV, kIter % stageCount);
+          }
+          // copy to the block with the same bid.y
+          uint32_t block_id = dst_id_KV.x + bid.y * cluster_shape.x;
+          pipeline.dsmem_copy_prepare(TmaTransactionBytesK, block_id, eK, dst_id_KV.iter % stageCount);
+          pipeline.dsmem_copy_prepare(TmaTransactionBytesV, block_id, eV, dst_id_KV.iter % stageCount);
+          BarrierType* tmaBarK = pipeline.producer_get_barrier_by_stage(dst_id_KV.iter % stageCount, eK);
+          BarrierType* tmaBarV = pipeline.producer_get_barrier_by_stage(dst_id_KV.iter % stageCount, eV);
+          
+          src_int_addr = cast_smem_ptr_to_uint(tKsK(_,_,_,producer_dsmem_send_state.index()).data().get().get());
+          smem_int_mbar = set_block_rank(cast_smem_ptr_to_uint(tmaBarK), block_id);
+          remote_addr = set_block_rank(cast_smem_ptr_to_uint(tKsK(_,_,_,dst_stage).data().get().get()), block_id);
+          noc::dsmem_copy_func(src_int_addr, remote_addr, smem_int_mbar, TmaTransactionBytesK);
+          
+          src_int_addr = cast_smem_ptr_to_uint(tVsV(_,_,_,producer_dsmem_send_state.index()).data().get().get());
+          smem_int_mbar = set_block_rank(cast_smem_ptr_to_uint(tmaBarV), block_id);
+          remote_addr = set_block_rank(cast_smem_ptr_to_uint(tVsV(_,_,_,dst_stage).data().get().get()), block_id);
+          noc::dsmem_copy_func(src_int_addr, remote_addr, smem_int_mbar, TmaTransactionBytesV);
+        } 
+        ++kIter;
+        ++receiver_ready_state_KV;
+        ++producer_dsmem_send_state;
+        if (kIter % stageCount == 0) {
+          sender_ready_phase ^= 1;
+        }
+      }
+
+    }
+    // Monitor if the NoC copy is done, if done, notify the src block.
+    else if (threadIdx.x == 64) {
+      int tma_k_iter = nTilesOfK;
+      CUTLASS_PRAGMA_NO_UNROLL
+      for (; tma_k_iter > 0; --tma_k_iter) {
+        block_iter_id src_id_KV = shared_schedules.srcKV[bid.x][kIter % stageCount];
+        // Copy on this iteration is from dsmem
+        if (src_id_KV.x != -1) {
+          uint32_t block_id = src_id_KV.x + bid.y * cluster_shape.x;
+          pipeline.receiver_wait_dsmem_copy_finish(receiver_dsmem_copy_finish_phase, eK, kIter % stageCount);
+          pipeline.receiver_wait_dsmem_copy_finish(receiver_dsmem_copy_finish_phase, eV, kIter % stageCount);
+          pipeline.receiver_arrive_dsmem_copy_finish(block_id, eK, (src_id_KV.iter + stageCount) % stageCount);
+          pipeline.receiver_arrive_dsmem_copy_finish(block_id, eV, (src_id_KV.iter + stageCount) % stageCount);
+        }
+        ++kIter;
+        if (kIter % stageCount == 0) {
+          receiver_dsmem_copy_finish_phase ^= 1;
+        }
+      }
+    }
+    // If the previous iteration on this buffer issues a NoC copy, check if the NoC copy is done,
+    // if done, notify the src block of this iteration
+    else if (threadIdx.x == 96) {
+      int tma_k_iter = nTilesOfK;
+      CUTLASS_PRAGMA_NO_UNROLL
+      for (; tma_k_iter > 0; --tma_k_iter) {
+        if (shared_schedules.dstKV[bid.x][((kIter - stageCount) % stageCount + stageCount) % stageCount].x != -1) {
+          pipeline.sender_wait_dsmem_copy_finish(sender_dsmem_copy_finish_phase, eK, kIter % stageCount);
+          pipeline.sender_wait_dsmem_copy_finish(sender_dsmem_copy_finish_phase, eV, kIter % stageCount);
+          block_iter_id src_id_KV = shared_schedules.srcKV[bid.x][kIter % stageCount];
+          if (src_id_KV.x != -1) {
+            uint32_t block_id = src_id_KV.x + bid.y * cluster_shape.x;
+            pipeline.sync_arrive(block_id, eK, src_id_KV.iter);
+            pipeline.sync_arrive(block_id, eV, src_id_KV.iter);
+          }
+        }
+        ++kIter;
+        if (((kIter - stageCount) % stageCount + stageCount) % stageCount == 0) {
+          sender_dsmem_copy_finish_phase ^= 1;
+        }
       }
     }
   }
@@ -349,15 +514,15 @@ fmhaForwardPipelinedWspl(
 
       int stage = smem_pipe_read.index();
       // NOTICE: This requires bM*bN*4 <= bN * headdim / SplitNum
-      Tensor sNocS =
-          make_tensor(make_smem_ptr(reinterpret_cast<cutlass::half_t*>(shared_storage.kv.smem_k.data()) 
-                                    + size(smemLayoutK(_,_,0)) * stage + 0          ), smemLayoutPS);
-      Tensor sNocR =
-          make_tensor(make_smem_ptr(reinterpret_cast<cutlass::half_t*>(shared_storage.kv.smem_k.data())
-                                    + size(smemLayoutK(_,_,0)) * stage + size(sNocS)), smemLayoutPS);
+      // Tensor sNocS =
+      //     make_tensor(make_smem_ptr(reinterpret_cast<cutlass::half_t*>(shared_storage.kv.smem_k.data()) 
+      //                               + size(smemLayoutK(_,_,0)) * stage + 0          ), smemLayoutPS);
+      // Tensor sNocR =
+      //     make_tensor(make_smem_ptr(reinterpret_cast<cutlass::half_t*>(shared_storage.kv.smem_k.data())
+      //                               + size(smemLayoutK(_,_,0)) * stage + size(sNocS)), smemLayoutPS);
       fmhaForwardConsumer(Q, K, V, S, tSrQ, tSrK(_, _, _, stage), tSrS,
                           tOrV(_, _, _, stage), tOrO, tOrPLayout, reg2reg, rowMax,
-                          rowSum, tileShapeS, gmemLayoutS, scale, blockIdxY++,
+                          rowSum, tileShapeS, gmemLayoutS, scale, kIter++,
                           tiledMma0, tiledMma1, tiledMmaCvt0,
                           send_mbar_ptr, recv_mbar_ptr, 
                           sNocS, sNocR, producer_phase, consumer_phase, AccumType(0), SoftType(0));
@@ -365,6 +530,7 @@ fmhaForwardPipelinedWspl(
     }
     gemm_k_iterations -= mma_k_prologue;
 
+    int kReleaseIter = 0;
     CUTLASS_PRAGMA_NO_UNROLL
     for (; gemm_k_iterations > 0; --gemm_k_iterations) {
       /// Wait on the smem_pipe_read stage / phase
@@ -374,15 +540,15 @@ fmhaForwardPipelinedWspl(
 
       int stage = smem_pipe_read.index();
       // NOTICE: This requires bM*bN*4 <= bN * headdim / SplitNum
-      Tensor sNocS =
-          make_tensor(make_smem_ptr(reinterpret_cast<cutlass::half_t*>(shared_storage.kv.smem_k.data()) 
-                                    + size(smemLayoutK(_,_,0)) * stage + 0          ), smemLayoutPS);
-      Tensor sNocR =
-          make_tensor(make_smem_ptr(reinterpret_cast<cutlass::half_t*>(shared_storage.kv.smem_k.data())
-                                    + size(smemLayoutK(_,_,0)) * stage + size(sNocS)), smemLayoutPS);
+      // Tensor sNocS =
+      //     make_tensor(make_smem_ptr(reinterpret_cast<cutlass::half_t*>(shared_storage.kv.smem_k.data()) 
+      //                               + size(smemLayoutK(_,_,0)) * stage + 0          ), smemLayoutPS);
+      // Tensor sNocR =
+      //     make_tensor(make_smem_ptr(reinterpret_cast<cutlass::half_t*>(shared_storage.kv.smem_k.data())
+      //                               + size(smemLayoutK(_,_,0)) * stage + size(sNocS)), smemLayoutPS);
       fmhaForwardConsumer(Q, K, V, S, tSrQ, tSrK(_, _, _, stage), tSrS,
                           tOrV(_, _, _, stage), tOrO, tOrPLayout, reg2reg, rowMax,
-                          rowSum, tileShapeS, gmemLayoutS, scale, blockIdxY++,
+                          rowSum, tileShapeS, gmemLayoutS, scale, kIter++,
                           tiledMma0, tiledMma1, tiledMmaCvt0,
                           send_mbar_ptr, recv_mbar_ptr,
                           sNocS, sNocR, producer_phase, consumer_phase, AccumType(0), SoftType(0));
@@ -391,12 +557,22 @@ fmhaForwardPipelinedWspl(
       //    warpgroup_fence_operand(tSrS);
       //    warpgroup_fence_operand(tOrO);
 
+      if (threadIdx.x % 128 == 0) {
+        block_iter_id src_id_KV = shared_schedules.srcKV[bid.x][(kReleaseIter + stageCount) % stageCount];
+        if (src_id_KV.x != -1) {
+          uint32_t block_id = src_id_KV.x + bid.y * cluster_shape.x;
+          pipeline.receiver_arrive_sender(block_id, eK, src_id_KV.iter);
+          pipeline.receiver_arrive_sender(block_id, eV, src_id_KV.iter);
+        }
+      }
+
       pipeline.consumer_release_self(smem_pipe_release, eK);
       pipeline.consumer_release_self(smem_pipe_release, eV);
 
       // Advance stages
       ++smem_pipe_read;
       ++smem_pipe_release;
+      ++kReleaseIter;
     }
 
     warpgroup_wait<0>();

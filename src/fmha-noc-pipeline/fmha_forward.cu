@@ -369,6 +369,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   auto smem_size =
       int(sizeof(SharedStorage<MmaA, Mma2A, OutputType, decltype(smemLayoutQ),
                                decltype(smemLayoutK), decltype(smemLayoutS),
+                               decltype(smemLayoutPS),
                                decltype(smemLayoutV), decltype(smemLayoutO),
                                ClusterShape>));
   cfk::utils::set_smem_size(smem_size, kernel);
@@ -386,7 +387,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   dim3 grid_dims(ceil_div(size(M), size(bM{})), SplitNum, H * B);
 
   // Set the CLUSTER dimensions.
-  dim3 cluster_dims(size<0>(ClusterShape{}), SplitNum, size<2>(ClusterShape{}));
+  dim3 cluster_dims(IntraSplitNum, SplitNum, size<2>(ClusterShape{}));
 
   // Define the cluster launch parameter structure.
   cutlass::ClusterLaunchParams params{grid_dims, block_dims, cluster_dims,
