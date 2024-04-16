@@ -123,7 +123,7 @@ inline __device__ auto convert_layout_acc_rowcol(Layout acc_layout) {
 
 }  // end namespace noc
 
-constexpr int PatternLen = 4;
+constexpr int PatternLen = 5;
 constexpr int IntraSplitNum = 2;
 
 struct block_iter_id {
@@ -131,8 +131,8 @@ struct block_iter_id {
 };
 
 __device__ constexpr int8_t tile_order[IntraSplitNum][PatternLen] = {
-  {0, 1, 2, 3},
-  {1, 0, 2, 3},
+  {0, 1, 2, 3, 4},
+  {1, 0, 2, 3, 4},
 };
 // __device__ constexpr block_iter_id srcKV[2][PatternLen] = {
 //   {{-1, -1},{-1, -1}},
@@ -143,12 +143,42 @@ __device__ constexpr int8_t tile_order[IntraSplitNum][PatternLen] = {
 //   {{-1, -1},{-1, -1}},
 //   {{-1, -1},{-1, -1}},
 // };
+// __device__ constexpr block_iter_id srcKV[IntraSplitNum][PatternLen] = {
+//   {{-1, -1},{1, 0},{-1, -1},{-1, -1}},
+//   {{-1, -1},{0, 0},{-1, -1},{-1, -1}},
+// };
+
+// __device__ constexpr block_iter_id dstKV[IntraSplitNum][PatternLen] = {
+//   {{1, 1},{-1, -1},{-1, -1},{-1, -1}},
+//   {{0, 1},{-1, -1},{-1, -1},{-1, -1}},
+// };
+
 __device__ constexpr block_iter_id srcKV[IntraSplitNum][PatternLen] = {
-  {{-1, -1},{1, 0},{-1, -1},{-1, -1}},
-  {{-1, -1},{0, 0},{-1, -1},{-1, -1}},
+  {{-1, -1},{1, 0},{-1, -1},{-1, -1},{-1, -1}},
+  {{-1, -1},{0, 0},{-1, -1},{-1, -1},{-1, -1}},
 };
 
 __device__ constexpr block_iter_id dstKV[IntraSplitNum][PatternLen] = {
-  {{1, 1},{-1, -1},{-1, -1},{-1, -1}},
-  {{0, 1},{-1, -1},{-1, -1},{-1, -1}},
+  {{1, 1},{-1, -1},{-1, -1},{-1, -1},{-1, -1}},
+  {{0, 1},{-1, -1},{-1, -1},{-1, -1},{-1, -1}},
 };
+
+// __device__ constexpr block_iter_id srcK[IntraSplitNum][PatternLen] = {
+//   {{-1, -1},{1, 0},{-1, -1},{-1, -1}},
+//   {{-1, -1},{0, 0},{-1, -1},{-1, -1}},
+// };
+
+// __device__ constexpr block_iter_id srcV[IntraSplitNum][PatternLen] = {
+//   {{-1, -1},{1, 0},{-1, -1},{-1, -1}},
+//   {{-1, -1},{0, 0},{-1, -1},{-1, -1}},
+// };
+
+// __device__ constexpr block_iter_id dstK[IntraSplitNum][PatternLen] = {
+//   {{1, 1},{-1, -1},{-1, -1},{-1, -1}},
+//   {{0, 1},{-1, -1},{-1, -1},{-1, -1}},
+// };
+
+// __device__ constexpr block_iter_id dstV[IntraSplitNum][PatternLen] = {
+//   {{1, 1},{-1, -1},{-1, -1},{-1, -1}},
+//   {{0, 1},{-1, -1},{-1, -1},{-1, -1}},
+// };

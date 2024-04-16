@@ -91,6 +91,10 @@ struct SharedStorage {
     int8_t tileOrder[IntraSplitNum][PatternLen];
     block_iter_id srcKV[IntraSplitNum][PatternLen];
     block_iter_id dstKV[IntraSplitNum][PatternLen];
+    // block_iter_id srcK[IntraSplitNum][PatternLen];
+    // block_iter_id dstK[IntraSplitNum][PatternLen];
+    // block_iter_id srcV[IntraSplitNum][PatternLen];
+    // block_iter_id dstV[IntraSplitNum][PatternLen];
   } schedules;
 };
 #endif

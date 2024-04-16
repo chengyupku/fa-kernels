@@ -346,10 +346,11 @@ fmhaForwardPipelinedWspl(
           sender_dsmem_copy_finish_phase ^= 1;
         }
       }
-      int tma_k_iter = nTilesOfK - tma_k_prologue;
+      // int tma_k_iter = nTilesOfK - tma_k_prologue;
+      int pattern_iters = (nTilesOfK / PatternLen) * PatternLen - tma_k_prologue;
 
       CUTE_NO_UNROLL
-      for (; tma_k_iter > 0; --tma_k_iter) {
+      for (int i = 0; i < pattern_iters; ++i) {
         block_iter_id src_id_KV = shared_schedules.srcKV[bid.x][kIter % PatternLen];
         pipeline.wait_empty(producer_physical_state, eK);
         pipeline.wait_empty(producer_physical_state, eV);
@@ -370,6 +371,33 @@ fmhaForwardPipelinedWspl(
                               sV(_, _, stage), tmaLoadV, tileShapeV, gmemLayoutV,
                               kTileIter, tmaBarK, tmaBarV, ClusterShape());
         }
+        ++producer_physical_state;
+        ++producer_logical_state;
+        ++kIter;
+        if (((kIter - stageCount) % PatternLen + PatternLen) % PatternLen == 0) {
+          sender_dsmem_copy_finish_phase ^= 1;
+        }
+      }
+
+      int left_iters = nTilesOfK - tma_k_prologue - pattern_iters;
+      CUTE_NO_UNROLL
+      for (int i = 0; i < left_iters; ++i) {
+        pipeline.wait_empty(producer_physical_state, eK);
+        pipeline.wait_empty(producer_physical_state, eV);
+        pipeline.copy_prepare(producer_logical_state, eK);
+        pipeline.copy_prepare(producer_logical_state, eV);
+        BarrierType *tmaBarK = pipeline.producer_get_barrier(producer_logical_state, eK);
+        BarrierType *tmaBarV = pipeline.producer_get_barrier(producer_logical_state, eV);
+        auto stage = producer_physical_state.index();
+        int kTileIter = kIter;
+        if (i < stageCount && 
+            shared_schedules.dstKV[bid.x][((kIter - stageCount) % PatternLen + PatternLen) % PatternLen].x != -1) {
+          pipeline.sender_wait_dsmem_copy_finish(sender_dsmem_copy_finish_phase, eK, kIter % PatternLen);
+          pipeline.sender_wait_dsmem_copy_finish(sender_dsmem_copy_finish_phase, eV, kIter % PatternLen);
+        }
+        fmhaForwardProducer(sK(_, _, stage), tmaLoadK, tileShapeK, gmemLayoutK,
+                            sV(_, _, stage), tmaLoadV, tileShapeV, gmemLayoutV,
+                            kTileIter, tmaBarK, tmaBarV, ClusterShape());
         ++producer_physical_state;
         ++producer_logical_state;
         ++kIter;
@@ -405,9 +433,10 @@ fmhaForwardPipelinedWspl(
       }
       receiver_ready_state_KV.set_sep_stage(sep_stage);
 
-      int tma_k_iter = nTilesOfK;
+      // int tma_k_iter = nTilesOfK;
+      int pattern_iters = (nTilesOfK / PatternLen) * PatternLen;
       CUTE_NO_UNROLL
-      for (; tma_k_iter > 0; --tma_k_iter) {
+      for (int i = 0; i < pattern_iters; ++i) {
         auto stage = producer_noc_send_state.index();
         Tensor tKsK = blockTmaK.partition_D(sK);
         Tensor tVsV = blockTmaV.partition_D(sV);
@@ -451,9 +480,10 @@ fmhaForwardPipelinedWspl(
     }
     // Monitor if the NoC copy is done, if done, notify the src block.
     else if (threadIdx.x == 64) {
-      int tma_k_iter = nTilesOfK;
+      // int tma_k_iter = nTilesOfK;
+      int pattern_iters = (nTilesOfK / PatternLen) * PatternLen;
       CUTLASS_PRAGMA_NO_UNROLL
-      for (; tma_k_iter > 0; --tma_k_iter) {
+      for (int i = 0; i < pattern_iters; ++i) {
         block_iter_id src_id_KV = shared_schedules.srcKV[bid.x][kIter % PatternLen];
         // Copy on this iteration is from dsmem
         if (src_id_KV.x != -1) {
@@ -472,9 +502,10 @@ fmhaForwardPipelinedWspl(
     // If the previous iteration on this buffer issues a NoC copy, check if the NoC copy is done,
     // if done, notify the src block of this iteration
     else if (threadIdx.x == 96) {
-      int tma_k_iter = nTilesOfK;
+      // int tma_k_iter = nTilesOfK;
+      int pattern_iters = (nTilesOfK / PatternLen) * PatternLen;
       CUTLASS_PRAGMA_NO_UNROLL
-      for (; tma_k_iter > 0; --tma_k_iter) {
+      for (int i = 0; i < pattern_iters; ++i) {
         if (shared_schedules.dstKV[bid.x][((kIter - stageCount) % PatternLen + PatternLen) % PatternLen].x != -1) {
           pipeline.sender_wait_dsmem_copy_finish(sender_dsmem_copy_finish_phase, eK, kIter % PatternLen);
           pipeline.sender_wait_dsmem_copy_finish(sender_dsmem_copy_finish_phase, eV, kIter % PatternLen);
@@ -510,6 +541,7 @@ fmhaForwardPipelinedWspl(
     auto gemm_k_iterations = nTilesOfK;
 
     int mma_k_prologue = min(K_PIPE_MMAS, gemm_k_iterations);
+    int pattern_iters = (nTilesOfK / PatternLen) * PatternLen;
 
     CUTLASS_PRAGMA_UNROLL
     for (int iter = 0; iter < mma_k_prologue; ++iter) {
@@ -565,7 +597,7 @@ fmhaForwardPipelinedWspl(
 
       if (threadIdx.x % 128 == 0) {
         block_iter_id src_id_KV = shared_schedules.srcKV[bid.x][(kReleaseIter + stageCount) % PatternLen];
-        if (src_id_KV.x != -1) {
+        if (src_id_KV.x != -1 && kReleaseIter + stageCount < pattern_iters) {
           uint32_t block_id = src_id_KV.x + bid.y * cluster_shape.x;
           pipeline.receiver_arrive_sender(block_id, eK, src_id_KV.iter);
           pipeline.receiver_arrive_sender(block_id, eV, src_id_KV.iter);
