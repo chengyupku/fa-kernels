@@ -90,7 +90,8 @@ template <class Gemm1Type, class AccumType, class SoftType, class Gemm2Type,
           class TileShapeS, class GmemLayoutS, class SmemLayoutS, class SmemLayoutPS, 
           class TiledCopyV, class TileShapeV, class GmemLayoutV, class SmemLayoutV, 
           class SmemLayoutVt, class TiledCopyO, class TileShapeO, class GmemLayoutO,
-          class SmemLayoutO, class GmemLayoutMI, class ClusterShape>
+          class SmemLayoutO, class GmemLayoutDummyKV, class TiledCopyDummyK, class TiledCopyDummyV, 
+          class GmemLayoutMI, class ClusterShape>
 __global__ static void __launch_bounds__(384, 1)
 fmhaForwardPipelinedWspl(
     Gemm1Type const *Q, CUTE_GRID_CONSTANT TiledCopyQ const tmaLoadQ,
@@ -103,6 +104,9 @@ fmhaForwardPipelinedWspl(
     GmemLayoutV gmemLayoutV, SmemLayoutV smemLayoutV, SmemLayoutVt smemLayoutVt,
     OutputType *O, CUTE_GRID_CONSTANT TiledCopyO const tmaStoreO,
     TileShapeO tileShapeO, GmemLayoutO gmemLayoutO, SmemLayoutO smemLayoutO,
+    GmemLayoutDummyKV gmemLayoutDummyKV,
+    CUTE_GRID_CONSTANT TiledCopyDummyK const tmaLoadDummyK,
+    CUTE_GRID_CONSTANT TiledCopyDummyV const tmaLoadDummyV,
     SoftType *mi_ptr, SoftType *sPrimePtr, GmemLayoutMI gmemLayoutMi,
     float scale) {
   extern __shared__ char shared_memory[];
@@ -324,8 +328,8 @@ fmhaForwardPipelinedWspl(
         pipeline.wait_empty(producer_physical_state, eK);
         pipeline.wait_empty(producer_physical_state, eV);
         if (src_id_KV.x == -1) {
-          pipeline.copy_prepare(producer_logical_state, eK);
-          pipeline.copy_prepare(producer_logical_state, eV);
+          pipeline.copy_prepare(producer_logical_state, eK, Align128Bytes(TmaTransactionBytesK * (1 + SIMULATE_MULTIPLE)));
+          pipeline.copy_prepare(producer_logical_state, eV, Align128Bytes(TmaTransactionBytesV * (1 + SIMULATE_MULTIPLE)));
         }
         BarrierType *tmaBarK = pipeline.producer_get_barrier(producer_logical_state, eK);
         BarrierType *tmaBarV = pipeline.producer_get_barrier(producer_logical_state, eV);
@@ -337,6 +341,7 @@ fmhaForwardPipelinedWspl(
           }
           fmhaForwardProducer(sK(_, _, i), tmaLoadK, tileShapeK, gmemLayoutK,
                               sV(_, _, i), tmaLoadV, tileShapeV, gmemLayoutV,
+                              gmemLayoutDummyKV, tmaLoadDummyK, tmaLoadDummyV,
                               kTileIter, tmaBarK, tmaBarV, ClusterShape());
         }
         ++producer_physical_state;
@@ -355,8 +360,8 @@ fmhaForwardPipelinedWspl(
         pipeline.wait_empty(producer_physical_state, eK);
         pipeline.wait_empty(producer_physical_state, eV);
         if (src_id_KV.x == -1) {
-          pipeline.copy_prepare(producer_logical_state, eK);
-          pipeline.copy_prepare(producer_logical_state, eV);
+          pipeline.copy_prepare(producer_logical_state, eK, Align128Bytes(TmaTransactionBytesK * (1 + SIMULATE_MULTIPLE)));
+          pipeline.copy_prepare(producer_logical_state, eV, Align128Bytes(TmaTransactionBytesV * (1 + SIMULATE_MULTIPLE)));
         }
         BarrierType *tmaBarK = pipeline.producer_get_barrier(producer_logical_state, eK);
         BarrierType *tmaBarV = pipeline.producer_get_barrier(producer_logical_state, eV);
@@ -369,6 +374,7 @@ fmhaForwardPipelinedWspl(
           }
           fmhaForwardProducer(sK(_, _, stage), tmaLoadK, tileShapeK, gmemLayoutK,
                               sV(_, _, stage), tmaLoadV, tileShapeV, gmemLayoutV,
+                              gmemLayoutDummyKV, tmaLoadDummyK, tmaLoadDummyV,
                               kTileIter, tmaBarK, tmaBarV, ClusterShape());
         }
         ++producer_physical_state;
@@ -384,8 +390,8 @@ fmhaForwardPipelinedWspl(
       for (int i = 0; i < left_iters; ++i) {
         pipeline.wait_empty(producer_physical_state, eK);
         pipeline.wait_empty(producer_physical_state, eV);
-        pipeline.copy_prepare(producer_logical_state, eK);
-        pipeline.copy_prepare(producer_logical_state, eV);
+        pipeline.copy_prepare(producer_logical_state, eK, Align128Bytes(TmaTransactionBytesK * (1 + SIMULATE_MULTIPLE)));
+        pipeline.copy_prepare(producer_logical_state, eV, Align128Bytes(TmaTransactionBytesV * (1 + SIMULATE_MULTIPLE)));
         BarrierType *tmaBarK = pipeline.producer_get_barrier(producer_logical_state, eK);
         BarrierType *tmaBarV = pipeline.producer_get_barrier(producer_logical_state, eV);
         auto stage = producer_physical_state.index();
@@ -397,6 +403,7 @@ fmhaForwardPipelinedWspl(
         }
         fmhaForwardProducer(sK(_, _, stage), tmaLoadK, tileShapeK, gmemLayoutK,
                             sV(_, _, stage), tmaLoadV, tileShapeV, gmemLayoutV,
+                            gmemLayoutDummyKV, tmaLoadDummyK, tmaLoadDummyV,
                             kTileIter, tmaBarK, tmaBarV, ClusterShape());
         ++producer_physical_state;
         ++producer_logical_state;
@@ -454,20 +461,20 @@ fmhaForwardPipelinedWspl(
           }
           // copy to the block with the same bid.y
           uint32_t block_id = dst_id_KV.x + bid.y * cluster_shape.x;
-          pipeline.dsmem_copy_prepare(TmaTransactionBytesK, block_id, eK, dst_id_KV.iter % PatternLen);
-          pipeline.dsmem_copy_prepare(TmaTransactionBytesV, block_id, eV, dst_id_KV.iter % PatternLen);
+          pipeline.dsmem_copy_prepare(Align128Bytes(TmaTransactionBytesK / NOC_ACCL_MULTIPLE), block_id, eK, dst_id_KV.iter % PatternLen);
+          pipeline.dsmem_copy_prepare(Align128Bytes(TmaTransactionBytesV / NOC_ACCL_MULTIPLE), block_id, eV, dst_id_KV.iter % PatternLen);
           BarrierType* tmaBarK = pipeline.producer_get_barrier_by_stage(dst_id_KV.iter % PatternLen, eK);
           BarrierType* tmaBarV = pipeline.producer_get_barrier_by_stage(dst_id_KV.iter % PatternLen, eV);
           
           src_int_addr = cast_smem_ptr_to_uint(tKsK(_,_,_,stage).data().get().get());
           smem_int_mbar = set_block_rank(cast_smem_ptr_to_uint(tmaBarK), block_id);
           remote_addr = set_block_rank(cast_smem_ptr_to_uint(tKsK(_,_,_,dst_stage).data().get().get()), block_id);
-          noc::dsmem_copy_func(src_int_addr, remote_addr, smem_int_mbar, TmaTransactionBytesK);
+          noc::dsmem_copy_func(src_int_addr, remote_addr, smem_int_mbar, Align128Bytes(TmaTransactionBytesK / NOC_ACCL_MULTIPLE));
           
           src_int_addr = cast_smem_ptr_to_uint(tVsV(_,_,_,stage).data().get().get());
           smem_int_mbar = set_block_rank(cast_smem_ptr_to_uint(tmaBarV), block_id);
           remote_addr = set_block_rank(cast_smem_ptr_to_uint(tVsV(_,_,_,dst_stage).data().get().get()), block_id);
-          noc::dsmem_copy_func(src_int_addr, remote_addr, smem_int_mbar, TmaTransactionBytesV);
+          noc::dsmem_copy_func(src_int_addr, remote_addr, smem_int_mbar, Align128Bytes(TmaTransactionBytesV / NOC_ACCL_MULTIPLE));
         } 
         ++kIter;
         ++receiver_ready_state_KV;

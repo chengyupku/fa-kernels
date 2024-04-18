@@ -87,7 +87,8 @@ template <typename PrecType, typename Gemm2Type, typename SoftType,
           typename OutputType, int HEADDIM>
 void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
                        PrecType const *tensorQ, PrecType const *tensorK,
-                       Gemm2Type const *tensorV, PrecType *tensorS,
+                       Gemm2Type const *tensorV, PrecType const *tensorDummyK,
+                       PrecType const *tensorDummyV, PrecType *tensorS,
                        OutputType *tensorO, SoftType *miOut,
                        SoftType *sPrimeOut, int iterations, float scale,
                        cudaStream_t stream = 0) {
@@ -146,6 +147,8 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   auto ptrQ = reinterpret_cast<PrecType const *>(tensorQ);
   auto ptrK = reinterpret_cast<PrecType const *>(tensorK);
   auto ptrV = reinterpret_cast<Gemm2Type const *>(tensorV);
+  auto ptrDummyK = reinterpret_cast<PrecType const *>(tensorDummyK);
+  auto ptrDummyV = reinterpret_cast<PrecType const *>(tensorDummyV);
   auto tileShapeQ = make_shape(bM{}, bKblock{});
   auto smemLayoutQ =
       tile_to_shape(getSmemLayoutK<MmaA, HEADDIM / SplitNum>(),
@@ -259,6 +262,20 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
   auto srcSmemLayoutV = smemLayoutV;
 #endif
 
+#if SIMULATE_MULTIPLE > 0
+  Layout gmemLayoutDummyKV =
+      make_layout(make_shape(N, K / SplitNum, SplitNum, SIMULATE_MULTIPLE, H, B), 
+                  make_stride(K * H * SIMULATE_MULTIPLE, 1, K / SplitNum, H * K, K, H * N * K));
+#else
+  Layout gmemLayoutDummyKV =
+      make_layout(make_shape(N, K / SplitNum, SplitNum, 1, H, B), 
+                  make_stride(K * H, 1, K / SplitNum, H * K, K, H * N * K));
+#endif
+  auto gDummyK = make_tensor(ptrDummyK, gmemLayoutDummyKV);
+  auto gDummyV = make_tensor(ptrDummyV, gmemLayoutDummyKV);
+  auto tmaDummyK = make_tma_copy(TMA_LOAD{}, gDummyK, smemLayoutK(_, _, 0), tileShapeK, size<0>(ClusterShape{}));
+  auto tmaDummyV = make_tma_copy(TMA_LOAD{}, gDummyV, smemLayoutV(_, _, 0), tileShapeV, size<0>(ClusterShape{}));
+
   auto tileShapeO = make_shape(bM{}, bKblock{});
   Layout gmemLayoutO =
       make_layout(make_shape(M, K / SplitNum, SplitNum, H, B), make_stride(K * H, 1, K / SplitNum, K, H * M * K));
@@ -339,7 +356,8 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
       decltype(gmemLayoutS), decltype(smemLayoutS), decltype(smemLayoutPS),
       decltype(tmaV), decltype(tileShapeV), decltype(gmemLayoutV), decltype(smemLayoutV),
       decltype(smemLayoutVt), decltype(tmaO), decltype(tileShapeO),
-      decltype(gmemLayoutO), decltype(smemLayoutO), decltype(gmemLayoutMi),
+      decltype(gmemLayoutO), decltype(smemLayoutO), 
+      decltype(gmemLayoutDummyKV), decltype(tmaDummyK), decltype(tmaDummyV), decltype(gmemLayoutMi),
       ClusterShape>;
 
   auto ctaSize = size(TiledMma0{}) + NumCopyThreads;
@@ -403,7 +421,7 @@ void fmhaForwardDevice(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCH,
         tmak, tileShapeK, gmemLayoutK, smemLayoutK, tensorS, tileShapeS,
         gmemLayoutS, smemLayoutS, smemLayoutPS, nTilesOfK, tensorV, tmaV, tileShapeV,
         gmemLayoutV, smemLayoutV, smemLayoutVt, tensorO, tmaO, tileShapeO,
-        gmemLayoutO, smemLayoutO, miOut, sPrimeOut, gmemLayoutMi, scale);     
+        gmemLayoutO, smemLayoutO, gmemLayoutDummyKV, tmaDummyK, tmaDummyV, miOut, sPrimeOut, gmemLayoutMi, scale);     
   }
 }
 
@@ -413,13 +431,14 @@ template <typename PrecType, typename Gemm2Type, typename SoftType,
           typename OutputType, int HEADDIM>
 void fmhaForwardDeviceLoop(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCHSIZE,
                            PrecType const *Q, PrecType const *K, Gemm2Type *V,
+                           PrecType const *DummyK, PrecType const *DummyV,
                            PrecType *S, OutputType *D, SoftType *miOut,
                            SoftType *sPrimeOut, int iterations, int nStreams,
                            float scale) {
 
   if (nStreams == 1) {
     fmhaForwardDevice<PrecType, Gemm2Type, SoftType, OutputType, HEADDIM>(
-        SEQLEN, KEYLEN, NUMHEADS, BATCHSIZE, Q, K, V, S, D, miOut, sPrimeOut,
+        SEQLEN, KEYLEN, NUMHEADS, BATCHSIZE, Q, K, V, DummyK, DummyV, S, D, miOut, sPrimeOut,
         iterations, scale);
     return;
   } else {
@@ -437,6 +456,7 @@ void fmhaForwardDeviceLoop(int SEQLEN, int KEYLEN, int NUMHEADS, int BATCHSIZE,
 
       fmhaForwardDevice<PrecType, Gemm2Type, SoftType, OutputType, HEADDIM>(
           SEQLEN, KEYLEN, NUMHEADS, L, Q + offsetQ, K + offsetK, V + offsetV,
+          DummyK, DummyV,
           S + offsetS, D + offsetD, miOut + miOffset, sPrimeOut + miOffset,
           iterations, scale, stream);
     }
@@ -500,6 +520,13 @@ void testFmhaForward(int m, int n, int numHeads, int batchSize, int iterations,
   thrust::device_vector<Gemm2Type> devV(nLong * kLong * lLong);
   thrust::device_vector<Gemm2Type> devVt(nLong * kLong * lLong);
   thrust::device_vector<OutputType> devD(mLong * kLong * lLong);
+#if SIMULATE_MULTIPLE > 0
+  thrust::device_vector<PrecType> devDummyK(nLong * kLong * lLong * uint64_t(SIMULATE_MULTIPLE));
+  thrust::device_vector<PrecType> devDummyV(nLong * kLong * lLong * uint64_t(SIMULATE_MULTIPLE));
+#else
+  thrust::device_vector<PrecType> devDummyK(nLong * kLong * lLong);
+  thrust::device_vector<PrecType> devDummyV(nLong * kLong * lLong);
+#endif
 
   uint32_t seed = 3080;
 
@@ -602,7 +629,8 @@ void testFmhaForward(int m, int n, int numHeads, int batchSize, int iterations,
   devD = hostD;
   fmhaForwardDeviceLoop<PrecType, Gemm2Type, SoftType, OutputType, HEADDIM>(
       m, n, numHeads, batchSize, devQ.data().get(), devK.data().get(),
-      devVt.data().get(), devS.data().get(), devD.data().get(),
+      devVt.data().get(), devDummyK.data().get(), devDummyV.data().get(), 
+      devS.data().get(), devD.data().get(),
       devMiOut.data().get(), devSprimeOut.data().get(), 10, nStreams, scale);
   CUTE_CHECK_LAST();
 
@@ -612,7 +640,8 @@ void testFmhaForward(int m, int n, int numHeads, int batchSize, int iterations,
   timer.start();
   fmhaForwardDeviceLoop<PrecType, Gemm2Type, SoftType, OutputType, HEADDIM>(
       m, n, numHeads, batchSize, devQ.data().get(), devK.data().get(),
-      devVt.data().get(), devS.data().get(), devD.data().get(),
+      devVt.data().get(), devDummyK.data().get(), devDummyV.data().get(), 
+      devS.data().get(), devD.data().get(),
       devMiOut.data().get(), devSprimeOut.data().get(), iterations, nStreams,
       scale);
   double cute_time = timer.seconds() / (float)timing_iterations;

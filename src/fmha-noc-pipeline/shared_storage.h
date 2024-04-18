@@ -33,6 +33,7 @@ constexpr int NumMmaThreads = 128;
 
 // #include "cutlass/pipeline/pipeline.hpp"
 #include "async_pipeline.hpp"
+#include "noc_config.h"
 #include "utils.h"
 
 // Shared Storage with Aligned addresses.

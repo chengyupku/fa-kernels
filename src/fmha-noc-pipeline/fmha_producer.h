@@ -6,14 +6,18 @@
 template <class TensorEngineK, class SmemLayoutK, class TiledCopyK,
           class TileShapeK, class GmemLayoutK, class TensorEngineV,
           class SmemLayoutV, class TiledCopyV, class TileShapeV,
-          class GmemLayoutV, class BarrierType, class ClusterShape>
+          class TiledCopyDummyK, class TiledCopyDummyV,
+          class GmemLayoutV, class GmemLayoutDummyKV, class BarrierType, class ClusterShape>
 __device__ static void //__launch_bounds__(128, 2)
 fmhaForwardProducer(Tensor<TensorEngineK, SmemLayoutK> &&sK,
                     TiledCopyK const &tmaLoadK, TileShapeK tileShapeK,
                     GmemLayoutK gmemLayoutK,
                     Tensor<TensorEngineV, SmemLayoutV> &&sV,
                     TiledCopyV const &tmaLoadV, TileShapeV tileShapeV,
-                    GmemLayoutV gmemLayoutV, int blockIdxY, 
+                    GmemLayoutV gmemLayoutV, 
+                    GmemLayoutDummyKV gmemLayoutDummyKV,
+                    TiledCopyDummyK const &tmaLoadDummyK, TiledCopyDummyV const &tmaLoadDummyV,
+                    int blockIdxY, 
                     BarrierType *tmaBarK, BarrierType *tmaBarV, 
                     const ClusterShape &) {
 
@@ -32,6 +36,9 @@ fmhaForwardProducer(Tensor<TensorEngineK, SmemLayoutK> &&sK,
   Tensor mK = tmaLoadK.get_tma_tensor(shape(gmemLayoutK));
   Tensor mV = tmaLoadV.get_tma_tensor(shape(gmemLayoutV));
 
+  Tensor mDummyK = tmaLoadDummyK.get_tma_tensor(shape(gmemLayoutDummyKV));
+  Tensor mDummyV = tmaLoadDummyV.get_tma_tensor(shape(gmemLayoutDummyKV));
+
   // NOTICE: block_rank_in_cluster is hard coded to 0
   // uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
   uint32_t block_rank_in_cluster = 0;
@@ -40,6 +47,9 @@ fmhaForwardProducer(Tensor<TensorEngineK, SmemLayoutK> &&sK,
                                   block_rank_in_cluster / cluster_shape_x};
   auto blockTmaK = tmaLoadK.get_slice(cluster_local_block_id.x);
   auto blockTmaV = tmaLoadV.get_slice(cluster_local_block_id.x);
+
+  auto blockTmaDummyK = tmaLoadDummyK.get_slice(cluster_local_block_id.x);
+  auto blockTmaDummyV = tmaLoadDummyV.get_slice(cluster_local_block_id.x);
 
   //
   // Partition the copying of dest tiles for K and V among threads.
@@ -86,4 +96,20 @@ fmhaForwardProducer(Tensor<TensorEngineK, SmemLayoutK> &&sK,
   // Uses TMA multicast for CLUSTERN>1
   copy(tmaLoadK.with(*tmaBarK, mcast_mask_a), tKgK(_, 0), tKsK(_, 0));
   copy(tmaLoadV.with(*tmaBarV, mcast_mask_a), tVgV(_, 0), tVsV(_, 0));
+
+#if SIMULATE_MULTIPLE > 0
+  CUTLASS_PRAGMA_UNROLL
+  for (int i = 0; i < SIMULATE_MULTIPLE; i++) {
+    Tensor gDummyK = local_tile(mDummyK(_,_,clusterBlockRank / cluster_shape.x, i,_,_), tileShapeK, blkCoordK);
+    Tensor tDummyKgKX = blockTmaDummyK.partition_S(gDummyK);
+    Tensor tDummyKgK = group_modes<1, rank(tDummyKgKX)>(tDummyKgKX); // (TMA,REST)
+
+    Tensor gDummyV = local_tile(mDummyV(_,_,clusterBlockRank / cluster_shape.x, i,_,_), tileShapeV, blkCoordV);
+    Tensor tDummyVgVX = blockTmaDummyV.partition_S(gDummyV);
+    Tensor tDummyVgV = group_modes<1, rank(tDummyVgVX)>(tDummyVgVX); // (TMA,REST)
+
+    copy(tmaLoadDummyK.with(*tmaBarK, mcast_mask_a), tDummyKgK(_, 0), tKsK(_, 0));
+    copy(tmaLoadDummyV.with(*tmaBarV, mcast_mask_a), tDummyVgV(_, 0), tVsV(_, 0));
+  }
+#endif
 }
