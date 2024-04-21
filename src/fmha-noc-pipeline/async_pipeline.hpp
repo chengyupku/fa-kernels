@@ -260,7 +260,12 @@ public :
 
   CUTLASS_DEVICE
   void wait_empty(PhysicalPipelineState state, uint32_t var) {
-    empty_barrier_ptr_[var][state.index()].wait(state.phase());
+    uint32_t done;
+    done = empty_barrier_ptr_[var][state.index()].test_wait(state.phase());
+    if (not done) {
+      empty_barrier_ptr_[var][state.index()].wait(state.phase());
+    }
+    // empty_barrier_ptr_[var][state.index()].wait(state.phase());
   }
 
   CUTLASS_DEVICE
@@ -487,14 +492,22 @@ private :
   // Wait for producer to commit transactions (done by TMA)
   CUTLASS_DEVICE
   void consumer_wait(uint32_t stage, uint32_t phase, uint32_t var) {
-    full_barrier_ptr_[var][stage].wait(phase);
+    uint32_t done;
+    done = full_barrier_ptr_[var][stage].test_wait(phase);
+    if (not done) {
+      full_barrier_ptr_[var][stage].wait(phase);
+    }
   }
 
   // Wait for producer to commit transactions (done by TMA)
   CUTLASS_DEVICE
   void consumer_wait(uint32_t stage, uint32_t phase, ConsumerToken barrier_token, uint32_t var) {
     if (barrier_token == BarrierStatus::WaitAgain) {
-      full_barrier_ptr_[var][stage].wait(phase);
+      uint32_t done;
+      done = full_barrier_ptr_[var][stage].test_wait(phase);
+      if (not done) {
+        full_barrier_ptr_[var][stage].wait(phase);
+      }
     }
   }
 

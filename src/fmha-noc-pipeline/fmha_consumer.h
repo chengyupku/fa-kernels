@@ -16,7 +16,7 @@ template <class Gemm1Type, class AccumType, class SoftType, class Gemm2Type,
           typename RegLayout, typename Reg2Reg,
           typename RowMax, typename RowSum, typename FullBarrier, typename EmptyBarrier>
 __device__ static void //__launch_bounds__(128, 2)
-fmhaForwardConsumer(Gemm1Type const *Q, Gemm1Type const *K, Gemm2Type const *V, Gemm1Type *S, 
+fmhaForwardConsumerK(Gemm1Type const *Q, Gemm1Type const *K, Gemm2Type const *V, Gemm1Type *S, 
                     const TensorQ &tSrQ, const TensorK &tSrK, TensorS &&tSrS, const TensorV &tOrV, TensorO &tOrO,
                     const RegLayout &tOrPLayout, Reg2Reg & reg2reg, RowMax &rowMax, RowSum &rowSum,
                     const TileShapeS &tileShapeS, const GmemLayoutS &gmemLayoutS, float scale, int blockIdxY,
@@ -52,7 +52,9 @@ fmhaForwardConsumer(Gemm1Type const *Q, Gemm1Type const *K, Gemm2Type const *V, 
 
     if (threadIdx.x == 128) {
       noc::arrive_empty(recv_mbar_ptr, src_id);
+      noc::wait_empty(recv_mbar_ptr, producer_phase);
     }
+    synchronize();
 
     using CopyAtomC = Copy_Atom<SM90_U32x4_STSM_N, cutlass::half_t>;
     TiledCopy tiled_copy_C_atom = make_tiled_copy_C_atom(CopyAtomC{}, tiledMmaCvt0);
@@ -63,6 +65,12 @@ fmhaForwardConsumer(Gemm1Type const *Q, Gemm1Type const *K, Gemm2Type const *V, 
     Tensor tRS_rS = make_tensor(make_smem_ptr(reinterpret_cast<SmemType*>(tSrS.data())), tRS_rS_layout);                                          // (R2S,R2S_M,R2S_N)
     copy(tiled_r2s, tRS_rS, tRS_sS);
     synchronize();
+
+    // if (threadIdx.x == 128) {
+    // //   noc::arrive_empty(recv_mbar_ptr, src_id);
+    //   noc::wait_empty(recv_mbar_ptr, producer_phase);
+    // }
+    // synchronize();
 
     // Send local (partial) acc_s to neighbour
     // cluster.sync();
@@ -111,6 +119,25 @@ fmhaForwardConsumer(Gemm1Type const *Q, Gemm1Type const *K, Gemm2Type const *V, 
   Tensor tSgS = threadMma0.partition_C(gS);
   copy(tSrS, tSgS);
 #endif
+}
+
+// FMHA Consumer does GEMMs and softmax
+template <class Gemm1Type, class AccumType, class SoftType, class Gemm2Type,
+          class TiledMma0, class TiledMma1, class TiledMmaCvt0, class TileShapeS, 
+          class GmemLayoutS, typename TensorQ, typename TensorK, typename TensorS,
+          typename TensorV, typename TensorO, typename TensorSS, typename TensorSR,
+          typename RegLayout, typename Reg2Reg,
+          typename RowMax, typename RowSum, typename FullBarrier, typename EmptyBarrier>
+__device__ static void //__launch_bounds__(128, 2)
+fmhaForwardConsumerV(Gemm1Type const *Q, Gemm1Type const *K, Gemm2Type const *V, Gemm1Type *S, 
+                    const TensorQ &tSrQ, const TensorK &tSrK, TensorS &&tSrS, const TensorV &tOrV, TensorO &tOrO,
+                    const RegLayout &tOrPLayout, Reg2Reg & reg2reg, RowMax &rowMax, RowSum &rowSum,
+                    const TileShapeS &tileShapeS, const GmemLayoutS &gmemLayoutS, float scale, int blockIdxY,
+                    const TiledMma0 &tiledMma0, const TiledMma1 &tiledMma1, const TiledMmaCvt0 &tiledMmaCvt0,
+                    FullBarrier* send_mbar_ptr, EmptyBarrier* recv_mbar_ptr, TensorSS& sNocS, TensorSR& sNocR,
+                    uint32_t& producer_phase, uint32_t& consumer_phase, const AccumType &, const SoftType &) {
+
+  using namespace cute;
 
   if (blockIdxY == 0) { // Compute Online Softmax and NO Output Rescaling.
     onlineSoftmaxAndRescale<true, SoftType>(rowMax, rowSum, tSrS, tOrO, scale);
@@ -118,27 +145,9 @@ fmhaForwardConsumer(Gemm1Type const *Q, Gemm1Type const *K, Gemm2Type const *V, 
     onlineSoftmaxAndRescale<false, SoftType>(rowMax, rowSum, tSrS, tOrO, scale);
   }
   warpgroup_fence_operand(tSrS);
-
-  // ISSUE GEMM-II with Operand A from RMEM.
-  // Convert Operand A from SoftType [=float or half] to Gemm2Type [=half_t or
-  // fp8] before issuing.
+  
   auto tSrSPrec = convert_type<Gemm2Type, AccumType>(tSrS);
-  // Invoke additional register permute/shuffle if GEMM-II is FP8.
-#ifdef GEMM2FP8
-  reg2reg(tSrSPrec);
-#endif
   auto tOrP = make_tensor(tSrSPrec.data(), tOrPLayout);
   warpgroup_fence_operand(tSrS);
-  // Issue GEMM-II.
-#if 0
-  if (cute::thread0()) {
-        print("\n");
-        print(tOrPLayout);
-        print("\n");
-        print(tOrV.layout());
-        print("\n");
-   }
-#endif
-
   cfk::gemm(tiledMma1, tOrP, tOrV, tOrO);
 }
