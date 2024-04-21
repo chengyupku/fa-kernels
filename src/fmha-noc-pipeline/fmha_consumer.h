@@ -50,12 +50,6 @@ fmhaForwardConsumerK(Gemm1Type const *Q, Gemm1Type const *K, Gemm2Type const *V,
     uint32_t dst_id = (((clusterBlockRank / cluster_shape.x) + dst_group_size) % (dst_group_size << 1) 
                     + ((clusterBlockRank / cluster_shape.x) / (dst_group_size << 1)) * (dst_group_size << 1)) * cluster_shape.x + clusterBlockRank % cluster_shape.x;
 
-    if (threadIdx.x == 128) {
-      noc::arrive_empty(recv_mbar_ptr, src_id);
-      noc::wait_empty(recv_mbar_ptr, producer_phase);
-    }
-    synchronize();
-
     using CopyAtomC = Copy_Atom<SM90_U32x4_STSM_N, cutlass::half_t>;
     TiledCopy tiled_copy_C_atom = make_tiled_copy_C_atom(CopyAtomC{}, tiledMmaCvt0);
     TiledCopy tiled_r2s = make_tiled_copy_S(Copy_Atom<SM90_U32x4_STSM_N,SmemType>{}, tiled_copy_C_atom);
@@ -66,21 +60,20 @@ fmhaForwardConsumerK(Gemm1Type const *Q, Gemm1Type const *K, Gemm2Type const *V,
     copy(tiled_r2s, tRS_rS, tRS_sS);
     synchronize();
 
-    // if (threadIdx.x == 128) {
-    // //   noc::arrive_empty(recv_mbar_ptr, src_id);
-    //   noc::wait_empty(recv_mbar_ptr, producer_phase);
-    // }
-    // synchronize();
+    if (threadIdx.x == 128) {
+      // noc::arrive_empty(recv_mbar_ptr, src_id);
+      noc::wait_empty(recv_mbar_ptr, producer_phase);
+      producer_phase ^= 1;
+    }
+    synchronize();
 
     // Send local (partial) acc_s to neighbour
     // cluster.sync();
     if (threadIdx.x == 128) {
-      uint32_t transaction_bytes = size(sNocS) * sizeof(SmemType);
+      uint32_t transaction_bytes = Align128Bytes((size(sNocS) * sizeof(SmemType)) / NOC_ACCL_MULTIPLE);
       uint32_t src_int_addr = cast_smem_ptr_to_uint(sNocS.data().get().get());
       uint32_t smem_int_mbar = set_block_rank(cast_smem_ptr_to_uint(send_mbar_ptr), dst_id);
       uint32_t remote_addr = set_block_rank(cast_smem_ptr_to_uint(sNocR.data().get().get()), dst_id);
-      noc::wait_empty(recv_mbar_ptr, producer_phase);
-      producer_phase ^= 1;
       noc::dsmem_copy_prepare(send_mbar_ptr, transaction_bytes, dst_id);
       noc::dsmem_copy_func(src_int_addr, remote_addr, smem_int_mbar, transaction_bytes);
     }
@@ -104,6 +97,9 @@ fmhaForwardConsumerK(Gemm1Type const *Q, Gemm1Type const *K, Gemm2Type const *V,
     Tensor B = flatten(make_tensor(tSrR(_,0,0).data(), tSrR(_,0,0).layout()));
     noc::reduce_in_place(A, B);
     synchronize();
+    if (threadIdx.x == 128) {
+      noc::arrive_empty(recv_mbar_ptr, src_id);
+    }
   }
 
 // Required for verification ONLY.
